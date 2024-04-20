@@ -9,6 +9,16 @@ use graph::components::store::{DeploymentId, DeploymentLocator, SubscriptionMana
 use graph::components::subgraph::Settings;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data::subgraph::Graft;
+use graph::futures01;
+use graph::futures01::future;
+use graph::futures01::stream;
+use graph::futures01::Future;
+use graph::futures01::Stream;
+use graph::futures03::compat::Future01CompatExt;
+use graph::futures03::compat::Stream01CompatExt;
+use graph::futures03::future::FutureExt;
+use graph::futures03::future::TryFutureExt;
+use graph::futures03::stream::TryStreamExt;
 use graph::prelude::{
     CreateSubgraphResult, SubgraphAssignmentProvider as SubgraphAssignmentProviderTrait,
     SubgraphRegistrar as SubgraphRegistrarTrait, *,
@@ -406,6 +416,24 @@ where
                 )
                 .await?
             }
+            BlockchainKind::Starknet => {
+                create_subgraph_version::<graph_chain_starknet::Chain, _>(
+                    &logger,
+                    self.store.clone(),
+                    self.chains.cheap_clone(),
+                    name.clone(),
+                    hash.cheap_clone(),
+                    start_block_override,
+                    graft_block_override,
+                    raw,
+                    node_id,
+                    debug_fork,
+                    self.version_switching_mode,
+                    &self.resolver,
+                    history_blocks,
+                )
+                .await?
+            }
         };
 
         debug!(
@@ -440,6 +468,26 @@ where
             locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
 
         self.store.reassign_subgraph(&deployment, node_id)?;
+
+        Ok(())
+    }
+
+    async fn pause_subgraph(&self, hash: &DeploymentHash) -> Result<(), SubgraphRegistrarError> {
+        let locator = self.store.active_locator(hash)?;
+        let deployment =
+            locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
+
+        self.store.pause_subgraph(&deployment)?;
+
+        Ok(())
+    }
+
+    async fn resume_subgraph(&self, hash: &DeploymentHash) -> Result<(), SubgraphRegistrarError> {
+        let locator = self.store.active_locator(hash)?;
+        let deployment =
+            locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
+
+        self.store.resume_subgraph(&deployment)?;
 
         Ok(())
     }
@@ -568,7 +616,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     debug_fork: Option<DeploymentHash>,
     version_switching_mode: SubgraphVersionSwitchingMode,
     resolver: &Arc<dyn LinkResolver>,
-    history_blocks: Option<i32>,
+    history_blocks_override: Option<i32>,
 ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
     let raw_string = serde_yaml::to_string(&raw).unwrap();
     let unvalidated = UnvalidatedSubgraphManifest::<C>::resolve(
@@ -667,8 +715,9 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
         .graft(base_block)
         .debug(debug_fork)
         .entities_with_causality_region(needs_causality_region);
-    if let Some(history_blocks) = history_blocks {
-        deployment = deployment.with_history_blocks(history_blocks);
+
+    if let Some(history_blocks) = history_blocks_override {
+        deployment = deployment.with_history_blocks_override(history_blocks);
     }
 
     deployment_store

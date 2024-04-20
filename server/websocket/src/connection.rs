@@ -1,13 +1,17 @@
-use futures::sync::mpsc;
-use futures03::stream::SplitStream;
-use graphql_parser::parse_query;
-use http::StatusCode;
+use graph::futures01::sync::mpsc;
+use graph::futures01::{Future, IntoFuture, Sink as _, Stream as _};
+use graph::futures03::future::TryFutureExt;
+use graph::futures03::sink::SinkExt;
+use graph::futures03::stream::{SplitStream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
+use tokio_tungstenite::tungstenite::{
+    http::Response as WsResponse, http::StatusCode, Error as WsError, Message as WsMessage,
+};
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
+use graph::futures03::compat::Future01CompatExt;
 use graph::{data::query::QueryTarget, prelude::*};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,10 +44,9 @@ impl IncomingMessage {
     pub fn from_ws_message(msg: WsMessage) -> Result<Self, WsError> {
         let text = msg.into_text()?;
         serde_json::from_str(text.as_str()).map_err(|e| {
-            WsError::Http(http::Response::new(Some(format!(
-                "Invalid GraphQL over WebSocket message: {}: {}",
-                text, e
-            ))))
+            let msg =
+                format!("Invalid GraphQL over WebSocket message: {}: {}", text, e).into_bytes();
+            WsError::Http(WsResponse::new(Some(msg)))
         })
     }
 }
@@ -91,7 +94,7 @@ fn send_message(
     msg: OutgoingMessage,
 ) -> Result<(), WsError> {
     sink.unbounded_send(msg.into()).map_err(|_| {
-        let mut response = http::Response::new(None);
+        let mut response = WsResponse::new(None);
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         WsError::Http(response)
     })
@@ -105,7 +108,7 @@ fn send_error_string(
 ) -> Result<(), WsError> {
     sink.unbounded_send(OutgoingMessage::from_error_string(operation_id, error).into())
         .map_err(|_| {
-            let mut response = http::Response::new(None);
+            let mut response = WsResponse::new(None);
             *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             WsError::Http(response)
         })
@@ -261,7 +264,7 @@ where
 
                     // Parse the GraphQL query document; respond with a GQL_ERROR if
                     // the query is invalid
-                    let query = match parse_query(&payload.query) {
+                    let query = match q::parse_query(&payload.query) {
                         Ok(query) => query.into_static(),
                         Err(e) => {
                             return send_error_string(

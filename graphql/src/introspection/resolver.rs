@@ -1,6 +1,6 @@
+use graph::components::store::QueryPermit;
 use graph::data::graphql::ext::{FieldExt, TypeDefinitionExt};
 use graph::data::query::Trace;
-use graphql_parser::Pos;
 use std::collections::BTreeMap;
 
 use graph::data::graphql::{object, DocumentExt, ObjectOrInterface};
@@ -359,7 +359,7 @@ impl Resolver for IntrospectionResolver {
     // see `fn as_introspection_context`, so this value is irrelevant.
     const CACHEABLE: bool = false;
 
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError> {
+    async fn query_permit(&self) -> Result<QueryPermit, QueryExecutionError> {
         unreachable!()
     }
 
@@ -424,7 +424,7 @@ impl Resolver for IntrospectionResolver {
             "__type" => {
                 let name = field.argument_value("name").ok_or_else(|| {
                     QueryExecutionError::MissingArgumentError(
-                        Pos::default(),
+                        q::Pos::default(),
                         "missing argument `name` in `__type(name: String!)`".to_owned(),
                     )
                 })?;

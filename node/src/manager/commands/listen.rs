@@ -2,17 +2,17 @@ use std::iter::FromIterator;
 use std::sync::Arc;
 use std::{collections::BTreeSet, io::Write};
 
-use futures::compat::Future01CompatExt;
+use crate::manager::deployment::DeploymentSearch;
+use graph::futures01::Stream as _;
+use graph::futures03::compat::Future01CompatExt;
 use graph::prelude::DeploymentHash;
 use graph::schema::{EntityType, InputSchema};
 use graph::{
     components::store::SubscriptionManager as _,
-    prelude::{serde_json, Error, Stream, SubscriptionFilter},
+    prelude::{serde_json, Error, SubscriptionFilter},
 };
 use graph_store_postgres::connection_pool::ConnectionPool;
 use graph_store_postgres::SubscriptionManager;
-
-use crate::manager::deployment::DeploymentSearch;
 
 async fn listen(
     mgr: Arc<SubscriptionManager>,
@@ -74,7 +74,7 @@ pub async fn entities(
                 writeln!(buf, "type {entity_type} @entity {{ id: ID! }}").unwrap();
                 buf
             });
-        let schema = InputSchema::parse(&schema, id.clone()).unwrap();
+        let schema = InputSchema::parse_latest(&schema, id.clone()).unwrap();
         entity_types
             .iter()
             .map(|et| schema.entity_type(et))

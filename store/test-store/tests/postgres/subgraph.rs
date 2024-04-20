@@ -1,3 +1,4 @@
+use graph::futures03;
 use graph::{
     components::{
         server::index_node::VersionInfo,
@@ -13,11 +14,11 @@ use graph::{
     prelude::EntityChange,
     prelude::EntityChangeOperation,
     prelude::QueryStoreManager,
+    prelude::StoreEvent,
     prelude::SubgraphManifest,
     prelude::SubgraphName,
     prelude::SubgraphVersionSwitchingMode,
     prelude::UnfailOutcome,
-    prelude::{futures03, StoreEvent},
     prelude::{CheapClone, DeploymentHash, NodeId, SubgraphStore as _},
     schema::InputSchema,
     semver::Version,
@@ -49,14 +50,14 @@ fn unassigned(deployment: &DeploymentLocator) -> EntityChange {
 }
 
 fn get_version_info(store: &Store, subgraph_name: &str) -> VersionInfo {
-    let primary = primary_connection();
+    let mut primary = primary_connection();
     let (current, _) = primary.versions_for_subgraph(subgraph_name).unwrap();
     let current = current.unwrap();
     store.version_info(&current).unwrap()
 }
 
 fn get_subgraph_features(id: String) -> Option<DeploymentFeatures> {
-    let primary = primary_connection();
+    let mut primary = primary_connection();
     primary.get_subgraph_features(id).unwrap()
 }
 
@@ -120,13 +121,13 @@ fn create_subgraph() {
     const SUBGRAPH_NAME: &str = "create/subgraph";
 
     // Return the versions (not deployments) for a subgraph
-    fn subgraph_versions(primary: &Primary) -> (Option<String>, Option<String>) {
+    fn subgraph_versions(primary: &mut Primary) -> (Option<String>, Option<String>) {
         primary.versions_for_subgraph(SUBGRAPH_NAME).unwrap()
     }
 
     /// Return the deployment for the current and the pending version of the
     /// subgraph with the given `entity_id`
-    fn subgraph_deployments(primary: &Primary) -> (Option<String>, Option<String>) {
+    fn subgraph_deployments(primary: &mut Primary) -> (Option<String>, Option<String>) {
         let (current, pending) = subgraph_versions(primary);
         (
             current.and_then(|v| primary.deployment_for_version(&v).unwrap()),
@@ -141,7 +142,7 @@ fn create_subgraph() {
     ) -> (DeploymentLocator, HashSet<EntityChange>) {
         let name = SubgraphName::new(SUBGRAPH_NAME.to_string()).unwrap();
         let id = DeploymentHash::new(id.to_string()).unwrap();
-        let schema = InputSchema::parse(SUBGRAPH_GQL, id.clone()).unwrap();
+        let schema = InputSchema::parse_latest(SUBGRAPH_GQL, id.clone()).unwrap();
 
         let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
             id,
@@ -154,6 +155,7 @@ fn create_subgraph() {
             graft: None,
             templates: vec![],
             chain: PhantomData,
+            indexer_hints: None,
         };
         let deployment = DeploymentCreate::new(String::new(), &manifest, None);
         let node_id = NodeId::new("left").unwrap();
@@ -204,11 +206,11 @@ fn create_subgraph() {
         const ID2: &str = "instant2";
         const ID3: &str = "instant3";
 
-        let primary = primary_connection();
+        let mut primary = primary_connection();
 
         let name = SubgraphName::new(SUBGRAPH_NAME.to_string()).unwrap();
         let (_, events) = tap_store_events(|| store.create_subgraph(name.clone()).unwrap());
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert!(events.is_empty());
         assert!(current.is_none());
         assert!(pending.is_none());
@@ -218,7 +220,7 @@ fn create_subgraph() {
         let expected = deploy_event(&deployment1);
         assert_eq!(expected, events);
 
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID1), current.as_deref());
         assert!(pending.is_none());
 
@@ -228,7 +230,7 @@ fn create_subgraph() {
         expected.insert(unassigned(&deployment1));
         assert_eq!(expected, events);
 
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID2), current.as_deref());
         assert!(pending.is_none());
 
@@ -241,7 +243,7 @@ fn create_subgraph() {
         expected.insert(unassigned(&deployment2));
         assert_eq!(expected, events);
 
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID3), current.as_deref());
         assert!(pending.is_none());
     });
@@ -256,11 +258,11 @@ fn create_subgraph() {
         const ID2: &str = "synced2";
         const ID3: &str = "synced3";
 
-        let primary = primary_connection();
+        let mut primary = primary_connection();
 
         let name = SubgraphName::new(SUBGRAPH_NAME.to_string()).unwrap();
         let (_, events) = tap_store_events(|| store.create_subgraph(name.clone()).unwrap());
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert!(events.is_empty());
         assert!(current.is_none());
         assert!(pending.is_none());
@@ -270,8 +272,8 @@ fn create_subgraph() {
         let expected = deploy_event(&deployment1);
         assert_eq!(expected, events);
 
-        let versions = subgraph_versions(&primary);
-        let (current, pending) = subgraph_deployments(&primary);
+        let versions = subgraph_versions(&mut primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID1), current.as_deref());
         assert!(pending.is_none());
 
@@ -279,7 +281,7 @@ fn create_subgraph() {
         let (deployment1_again, events) = deploy(store.as_ref(), ID1, MODE);
         assert!(events.is_empty());
         assert_eq!(&deployment1, &deployment1_again);
-        let versions2 = subgraph_versions(&primary);
+        let versions2 = subgraph_versions(&mut primary);
         assert_eq!(versions, versions2);
 
         // Deploy again, current is not synced, so it gets replaced
@@ -288,7 +290,7 @@ fn create_subgraph() {
         expected.insert(unassigned(&deployment1));
         assert_eq!(expected, events);
 
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID2), current.as_deref());
         assert!(pending.is_none());
 
@@ -298,8 +300,8 @@ fn create_subgraph() {
         let expected = deploy_event(&deployment3);
         assert_eq!(expected, events);
 
-        let versions = subgraph_versions(&primary);
-        let (current, pending) = subgraph_deployments(&primary);
+        let versions = subgraph_versions(&mut primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID2), current.as_deref());
         assert_eq!(Some(ID3), pending.as_deref());
 
@@ -307,9 +309,9 @@ fn create_subgraph() {
         let (deployment3_again, events) = deploy(store.as_ref(), ID3, MODE);
         assert!(events.is_empty());
         assert_eq!(&deployment3, &deployment3_again);
-        let versions2 = subgraph_versions(&primary);
+        let versions2 = subgraph_versions(&mut primary);
         assert_eq!(versions, versions2);
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID2), current.as_deref());
         assert_eq!(Some(ID3), pending.as_deref());
 
@@ -323,7 +325,7 @@ fn create_subgraph() {
         assert_eq!(&deployment2, &deployment2_again);
         assert_eq!(expected, events);
 
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID2), current.as_deref());
         assert_eq!(None, pending.as_deref());
 
@@ -334,7 +336,7 @@ fn create_subgraph() {
         assert_eq!(&deployment3, &deployment3_again);
         assert_eq!(expected, events);
 
-        let (current, pending) = subgraph_deployments(&primary);
+        let (current, pending) = subgraph_deployments(&mut primary);
         assert_eq!(Some(ID3), current.as_deref());
         assert_eq!(None, pending.as_deref());
     })
@@ -457,7 +459,7 @@ fn version_info() {
     async fn setup() -> DeploymentLocator {
         let id = DeploymentHash::new(NAME).unwrap();
         remove_subgraphs();
-        block_store::set_chain(vec![], NETWORK_NAME);
+        block_store::set_chain(vec![], NETWORK_NAME).await;
         create_test_subgraph(&id, SUBGRAPH_GQL).await
     }
 
@@ -499,7 +501,7 @@ fn subgraph_features() {
         let id = DeploymentHash::new(NAME).unwrap();
 
         remove_subgraphs();
-        block_store::set_chain(vec![], NETWORK_NAME);
+        block_store::set_chain(vec![], NETWORK_NAME).await;
         create_test_subgraph_with_features(&id, SUBGRAPH_GQL).await;
 
         let DeploymentFeatures {
@@ -540,7 +542,7 @@ fn subgraph_error() {
     test_store::run_test_sequentially(|store| async move {
         let subgraph_id = DeploymentHash::new("testSubgraph").unwrap();
         let deployment =
-            test_store::create_test_subgraph(&subgraph_id, "type Foo { id: ID! }").await;
+            test_store::create_test_subgraph(&subgraph_id, "type Foo @entity { id: ID! }").await;
 
         let count = || -> usize {
             let store = store.subgraph_store();
@@ -599,7 +601,7 @@ fn subgraph_non_fatal_error() {
         let subgraph_store = store.subgraph_store();
         let subgraph_id = DeploymentHash::new("subgraph_non_fatal_error").unwrap();
         let deployment =
-            test_store::create_test_subgraph(&subgraph_id, "type Foo { id: ID! }").await;
+            test_store::create_test_subgraph(&subgraph_id, "type Foo @entity { id: ID! }").await;
 
         let count = || -> usize {
             let store = store.subgraph_store();
@@ -696,19 +698,16 @@ fn fatal_vs_non_fatal() {
             .await
             .unwrap();
 
-        assert!(!query_store
-            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
-            .await
-            .unwrap());
+        let state = query_store.deployment_state().await.unwrap();
+
+        assert!(!state.has_deterministic_errors(&latest_block(&store, deployment.id).await));
 
         transact_errors(&store, &deployment, BLOCKS[1].clone(), vec![error()], false)
             .await
             .unwrap();
 
-        assert!(query_store
-            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
-            .await
-            .unwrap());
+        let state = query_store.deployment_state().await.unwrap();
+        assert!(state.has_deterministic_errors(&latest_block(&store, deployment.id).await));
     })
 }
 
@@ -744,10 +743,8 @@ fn fail_unfail_deterministic_error() {
         .unwrap();
 
         // We don't have any errors and the subgraph is healthy.
-        assert!(!query_store
-            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
-            .await
-            .unwrap());
+        let state = query_store.deployment_state().await.unwrap();
+        assert!(!state.has_deterministic_errors(&latest_block(&store, deployment.id).await));
         let vi = get_version_info(&store, NAME);
         assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
@@ -764,10 +761,8 @@ fn fail_unfail_deterministic_error() {
         .unwrap();
 
         // Still no fatal errors.
-        assert!(!query_store
-            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
-            .await
-            .unwrap());
+        let state = query_store.deployment_state().await.unwrap();
+        assert!(!state.has_deterministic_errors(&latest_block(&store, deployment.id).await));
         let vi = get_version_info(&store, NAME);
         assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
@@ -791,10 +786,8 @@ fn fail_unfail_deterministic_error() {
         writable.fail_subgraph(error).await.unwrap();
 
         // Now we have a fatal error because the subgraph failed.
-        assert!(query_store
-            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
-            .await
-            .unwrap());
+        let state = query_store.deployment_state().await.unwrap();
+        assert!(state.has_deterministic_errors(&latest_block(&store, deployment.id).await));
         let vi = get_version_info(&store, NAME);
         assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
@@ -808,10 +801,8 @@ fn fail_unfail_deterministic_error() {
 
         // We don't have fatal errors anymore and the block got reverted.
         assert_eq!(outcome, UnfailOutcome::Unfailed);
-        assert!(!query_store
-            .has_deterministic_errors(latest_block(&store, deployment.id).await.number)
-            .await
-            .unwrap());
+        let state = query_store.deployment_state().await.unwrap();
+        assert!(!state.has_deterministic_errors(&latest_block(&store, deployment.id).await));
         let vi = get_version_info(&store, NAME);
         assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);

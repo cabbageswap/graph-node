@@ -8,8 +8,8 @@ use graph::{
     components::{
         store::{DeploymentLocator, SubgraphFork},
         subgraph::{MappingError, ProofOfIndexingEvent, SharedProofOfIndexing},
+        trigger_processor::HostedTrigger,
     },
-    data_source::{self},
     prelude::{
         anyhow, async_trait, BlockHash, BlockNumber, BlockState, CheapClone, RuntimeHostBuilder,
     },
@@ -58,6 +58,28 @@ pub struct TriggerFilter {
     pub(crate) module_name: String,
     pub(crate) start_block: Option<BlockNumber>,
     pub(crate) data_sources_len: u8,
+    // the handler to call for subgraph mappings, if this is set then the binary block content
+    // should be passed to the mappings.
+    pub(crate) mapping_handler: Option<String>,
+}
+
+#[cfg(debug_assertions)]
+impl TriggerFilter {
+    pub fn modules(&self) -> &Option<Modules> {
+        &self.modules
+    }
+
+    pub fn module_name(&self) -> &str {
+        &self.module_name
+    }
+
+    pub fn start_block(&self) -> &Option<BlockNumber> {
+        &self.start_block
+    }
+
+    pub fn data_sources_len(&self) -> u8 {
+        self.data_sources_len
+    }
 }
 
 // TriggerFilter should bypass all triggers and just rely on block since all the data received
@@ -77,6 +99,7 @@ impl blockchain::TriggerFilter<Chain> for TriggerFilter {
             module_name,
             start_block,
             data_sources_len,
+            mapping_handler,
         } = self;
 
         if *data_sources_len >= 1 {
@@ -88,6 +111,7 @@ impl blockchain::TriggerFilter<Chain> for TriggerFilter {
             *modules = ds.source.package.modules.clone();
             *module_name = ds.source.module_name.clone();
             *start_block = ds.initial_block;
+            *mapping_handler = ds.mapping.handler.as_ref().map(|h| h.handler.clone());
         }
     }
 
@@ -170,19 +194,18 @@ impl<T> graph::prelude::TriggerProcessor<Chain, T> for TriggerProcessor
 where
     T: RuntimeHostBuilder<Chain>,
 {
-    async fn process_trigger(
-        &self,
+    async fn process_trigger<'a>(
+        &'a self,
         logger: &Logger,
-        _: Box<dyn Iterator<Item = &T::Host> + Send + '_>,
+        _: Vec<HostedTrigger<'a, Chain>>,
         block: &Arc<Block>,
-        _trigger: &data_source::TriggerData<Chain>,
-        mut state: BlockState<Chain>,
+        mut state: BlockState,
         proof_of_indexing: &SharedProofOfIndexing,
         causality_region: &str,
         _debug_fork: &Option<Arc<dyn SubgraphFork>>,
         _subgraph_metrics: &Arc<graph::prelude::SubgraphInstanceMetrics>,
         _instrument: bool,
-    ) -> Result<BlockState<Chain>, MappingError> {
+    ) -> Result<BlockState, MappingError> {
         for parsed_change in block.parsed_changes.clone().into_iter() {
             match parsed_change {
                 ParsedChanges::Unset => {
@@ -194,7 +217,7 @@ where
                     write_poi_event(
                         proof_of_indexing,
                         &ProofOfIndexingEvent::SetEntity {
-                            entity_type: key.entity_type.as_str(),
+                            entity_type: key.entity_type.typename(),
                             id: &key.entity_id.to_string(),
                             data: &entity,
                         },
@@ -212,7 +235,7 @@ where
                     write_poi_event(
                         proof_of_indexing,
                         &ProofOfIndexingEvent::RemoveEntity {
-                            entity_type: entity_type.as_str(),
+                            entity_type: entity_type.typename(),
                             id: &id.to_string(),
                         },
                         causality_region,

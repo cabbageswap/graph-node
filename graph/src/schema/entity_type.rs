@@ -1,7 +1,6 @@
 use std::{borrow::Borrow, fmt, sync::Arc};
 
 use anyhow::{Context, Error};
-use serde::Serialize;
 
 use crate::{
     cheap_clone::CheapClone,
@@ -12,18 +11,24 @@ use crate::{
     util::intern::Atom,
 };
 
-use super::{input_schema::POI_OBJECT, EntityKey, InputSchema};
+use super::{EntityKey, Field, InputSchema, InterfaceType, ObjectType, POI_OBJECT};
 
-/// The type name of an entity. This is the string that is used in the
-/// subgraph's GraphQL schema as `type NAME @entity { .. }`
+use graph_derive::CheapClone;
+
+/// A reference to a type in the input schema. It should mostly be the
+/// reference to a concrete entity type, either one declared with `@entity`
+/// in the input schema, or the object type that stores aggregations for a
+/// certain interval, in other words a type that is actually backed by a
+/// database table. However, it can also be a reference to an interface type
+/// for historical reasons.
 ///
 /// Even though it is not implemented as a string type, it behaves as if it
 /// were the string name of the type for all external purposes like
 /// comparison, ordering, and serialization
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 pub struct EntityType {
     schema: InputSchema,
-    atom: Atom,
+    pub(in crate::schema) atom: Atom,
 }
 
 impl EntityType {
@@ -31,9 +36,20 @@ impl EntityType {
         EntityType { schema, atom }
     }
 
+    /// Return the name of this type as a string.
     pub fn as_str(&self) -> &str {
         // unwrap: we constructed the entity type from the schema's pool
         self.schema.pool().get(self.atom).unwrap()
+    }
+
+    /// Return the name of the declared type from the input schema that this
+    /// type belongs to. For object and interface types, that's the same as
+    /// `as_str()`, but for aggregations it's the name of the aggregation
+    /// rather than the name of the specific aggregation for an interval. In
+    /// that case, `as_str()` might return `Stats_hour` whereas `typename()`
+    /// returns `Stats`
+    pub fn typename(&self) -> &str {
+        self.schema.typename(self.atom)
     }
 
     pub fn is_poi(&self) -> bool {
@@ -44,6 +60,10 @@ impl EntityType {
         self.schema.has_field(self.atom, field)
     }
 
+    pub fn field(&self, name: &str) -> Option<&Field> {
+        self.schema.field(self.atom, name)
+    }
+
     pub fn is_immutable(&self) -> bool {
         self.schema.is_immutable(self.atom)
     }
@@ -52,8 +72,11 @@ impl EntityType {
         self.schema.id_type(self.atom)
     }
 
-    pub fn object_type(&self) -> Option<&s::ObjectType> {
-        self.schema.find_object_type(self)
+    /// Return the object type for this entity type. It is an error to call
+    /// this if `entity_type` refers to an interface or an aggregation as
+    /// they don't have an underlying type that stores daa directly
+    pub fn object_type(&self) -> Result<&ObjectType, Error> {
+        self.schema.object_type(self.atom)
     }
 
     /// Create a key from this type for an onchain entity
@@ -84,7 +107,8 @@ impl EntityType {
             .into_iter()
             .map(|id| self.parse_id(id))
             .collect::<Result<_, _>>()?;
-        IdList::try_from_iter(self, ids.into_iter()).map_err(|e| anyhow::anyhow!("error: {}", e))
+        IdList::try_from_iter(self.id_type()?, ids.into_iter())
+            .map_err(|e| anyhow::anyhow!("error: {}", e))
     }
 
     /// Parse the given `id` into an `Id` and construct a key for an onchain
@@ -108,6 +132,24 @@ impl EntityType {
     fn same_pool(&self, other: &EntityType) -> bool {
         Arc::ptr_eq(self.schema.pool(), other.schema.pool())
     }
+
+    pub fn interfaces(&self) -> impl Iterator<Item = &InterfaceType> {
+        self.schema.interfaces(self.atom)
+    }
+
+    /// Return a list of all entity types that implement one of the
+    /// interfaces that `self` implements; the result does not include
+    /// `self`
+    pub fn share_interfaces(&self) -> Result<Vec<EntityType>, Error> {
+        self.schema.share_interfaces(self.atom)
+    }
+
+    /// Return `true` if `self` is an object type, i.e., a type that is
+    /// declared with an `@entity` directive in the input schema. This
+    /// specifically excludes interfaces and aggregations.
+    pub fn is_object_type(&self) -> bool {
+        self.schema.is_object_type(self.atom)
+    }
 }
 
 impl fmt::Display for EntityType {
@@ -122,17 +164,9 @@ impl Borrow<str> for EntityType {
     }
 }
 
-impl CheapClone for EntityType {}
-
 impl std::fmt::Debug for EntityType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "EntityType({})", self.as_str())
-    }
-}
-
-impl Serialize for EntityType {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.as_str().serialize(serializer)
     }
 }
 
@@ -178,6 +212,12 @@ impl AsEntityTypeName for &str {
 }
 
 impl AsEntityTypeName for &String {
+    fn name(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsEntityTypeName for &Word {
     fn name(&self) -> &str {
         self.as_str()
     }

@@ -1,15 +1,16 @@
 pub mod ethereum;
+pub mod substreams;
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Error;
 use async_stream::stream;
-use futures::{Stream, StreamExt};
 use graph::blockchain::block_stream::{
-    BlockRefetcher, BlockStream, BlockStreamBuilder, BlockStreamEvent, BlockWithTriggers,
-    FirehoseCursor,
+    BlockRefetcher, BlockStream, BlockStreamBuilder, BlockStreamError, BlockStreamEvent,
+    BlockWithTriggers, FirehoseCursor,
 };
 use graph::blockchain::{
     Block, BlockHash, BlockPtr, Blockchain, BlockchainMap, ChainIdentifier, RuntimeAdapter,
@@ -18,27 +19,35 @@ use graph::blockchain::{
 use graph::cheap_clone::CheapClone;
 use graph::components::link_resolver::{ArweaveClient, ArweaveResolver, FileSizeLimit};
 use graph::components::metrics::MetricsRegistry;
-use graph::components::store::{BlockStore, DeploymentLocator};
+use graph::components::store::{BlockStore, DeploymentLocator, EthereumCallCache};
 use graph::components::subgraph::Settings;
 use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::{Query, QueryTarget};
 use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth};
+use graph::endpoint::EndpointMetrics;
 use graph::env::EnvVars;
+use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints, SubgraphLimit};
+use graph::futures03::{Stream, StreamExt};
+use graph::http_body_util::Full;
+use graph::hyper::body::Bytes;
+use graph::hyper::Request;
 use graph::ipfs_client::IpfsClient;
 use graph::prelude::ethabi::ethereum_types::H256;
 use graph::prelude::serde_json::{self, json};
 use graph::prelude::{
-    async_trait, r, ApiVersion, BigInt, BlockNumber, DeploymentHash, GraphQlRunner as _,
-    LoggerFactory, NodeId, QueryError, SubgraphAssignmentProvider, SubgraphCountMetric,
-    SubgraphName, SubgraphRegistrar, SubgraphStore as _, SubgraphVersionSwitchingMode,
-    TriggerProcessor,
+    async_trait, lazy_static, q, r, ApiVersion, BigInt, BlockNumber, DeploymentHash,
+    GraphQlRunner as _, IpfsResolver, LoggerFactory, NodeId, QueryError,
+    SubgraphAssignmentProvider, SubgraphCountMetric, SubgraphName, SubgraphRegistrar,
+    SubgraphStore as _, SubgraphVersionSwitchingMode, TriggerProcessor,
 };
 use graph::schema::InputSchema;
-use graph::slog::crit;
+use graph_chain_ethereum::chain::RuntimeAdapterBuilder;
+use graph_chain_ethereum::network::EthereumNetworkAdapters;
+use graph_chain_ethereum::Chain;
 use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_core::{
-    LinkResolver, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
-    SubgraphInstanceManager, SubgraphRegistrar as IpfsSubgraphRegistrar, SubgraphTriggerProcessor,
+    SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider, SubgraphInstanceManager,
+    SubgraphRegistrar as IpfsSubgraphRegistrar, SubgraphTriggerProcessor,
 };
 use graph_node::manager::PanicSubscriptionManager;
 use graph_node::{config::Config, store_builder::StoreBuilder};
@@ -46,7 +55,7 @@ use graph_runtime_wasm::RuntimeHostBuilder;
 use graph_server_index_node::IndexNodeService;
 use graph_store_postgres::{ChainHeadUpdateListener, ChainStore, Store, SubgraphStore};
 use serde::Deserialize;
-use slog::{info, o, Discard, Logger};
+use slog::{crit, debug, info, o, Discard, Logger};
 use std::env::VarError;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,19 +80,77 @@ pub fn test_ptr_reorged(n: BlockNumber, reorg_n: u32) -> BlockPtr {
 
 type GraphQlRunner = graph_graphql::prelude::GraphQlRunner<Store, PanicSubscriptionManager>;
 
+struct CommonChainConfig {
+    logger_factory: LoggerFactory,
+    mock_registry: Arc<MetricsRegistry>,
+    chain_store: Arc<ChainStore>,
+    firehose_endpoints: FirehoseEndpoints,
+    node_id: NodeId,
+}
+
+impl CommonChainConfig {
+    async fn new(test_name: &str, stores: &Stores) -> Self {
+        let logger = test_logger(test_name);
+        let mock_registry = Arc::new(MetricsRegistry::mock());
+        let logger_factory = LoggerFactory::new(logger.cheap_clone(), None, mock_registry.clone());
+        let chain_store = stores.chain_store.cheap_clone();
+        let node_id = NodeId::new(NODE_ID).unwrap();
+
+        let firehose_endpoints: FirehoseEndpoints = vec![Arc::new(FirehoseEndpoint::new(
+            "",
+            "https://example.com",
+            None,
+            None,
+            true,
+            false,
+            SubgraphLimit::Unlimited,
+            Arc::new(EndpointMetrics::mock()),
+        ))]
+        .into();
+
+        Self {
+            logger_factory,
+            mock_registry,
+            chain_store,
+            firehose_endpoints,
+            node_id,
+        }
+    }
+}
+
 pub struct TestChain<C: Blockchain> {
     pub chain: Arc<C>,
     pub block_stream_builder: Arc<MutexBlockStreamBuilder<C>>,
 }
 
-impl<C: Blockchain> TestChain<C> {
-    pub fn set_block_stream(&self, blocks: Vec<BlockWithTriggers<C>>)
-    where
-        C::TriggerData: Clone,
-    {
+impl TestChainTrait<Chain> for TestChain<Chain> {
+    fn set_block_stream(&self, blocks: Vec<BlockWithTriggers<Chain>>) {
         let static_block_stream = Arc::new(StaticStreamBuilder { chain: blocks });
         *self.block_stream_builder.0.lock().unwrap() = static_block_stream;
     }
+
+    fn chain(&self) -> Arc<Chain> {
+        self.chain.clone()
+    }
+}
+
+pub struct TestChainSubstreams {
+    pub chain: Arc<graph_chain_substreams::Chain>,
+    pub block_stream_builder: Arc<graph_chain_substreams::BlockStreamBuilder>,
+}
+
+impl TestChainTrait<graph_chain_substreams::Chain> for TestChainSubstreams {
+    fn set_block_stream(&self, _blocks: Vec<BlockWithTriggers<graph_chain_substreams::Chain>>) {}
+
+    fn chain(&self) -> Arc<graph_chain_substreams::Chain> {
+        self.chain.clone()
+    }
+}
+
+pub trait TestChainTrait<C: Blockchain> {
+    fn set_block_stream(&self, blocks: Vec<BlockWithTriggers<C>>);
+
+    fn chain(&self) -> Arc<C>;
 }
 
 pub struct TestContext {
@@ -102,7 +169,7 @@ pub struct TestContext {
     pub env_vars: Arc<EnvVars>,
     pub ipfs: IpfsClient,
     graphql_runner: Arc<GraphQlRunner>,
-    indexing_status_service: Arc<IndexNodeService<GraphQlRunner, graph_store_postgres::Store>>,
+    indexing_status_service: Arc<IndexNodeService<graph_store_postgres::Store>>,
 }
 
 #[derive(Deserialize)]
@@ -138,17 +205,7 @@ impl TestContext {
         graph_chain_ethereum::Chain,
         RuntimeHostBuilder<graph_chain_ethereum::Chain>,
     > {
-        let logger = self.logger.cheap_clone();
-        let deployment = self.deployment.cheap_clone();
-
-        // Stolen from the IPFS provider, there's prolly a nicer way to re-use it
-        let file_bytes = self
-            .link_resolver
-            .cat(&logger, &deployment.hash.to_ipfs_link())
-            .await
-            .unwrap();
-
-        let raw: serde_yaml::Mapping = serde_yaml::from_slice(&file_bytes).unwrap();
+        let (logger, deployment, raw) = self.get_runner_context().await;
         let tp: Box<dyn TriggerProcessor<_, _>> = Box::new(SubgraphTriggerProcessor {});
 
         self.instance_manager
@@ -164,6 +221,47 @@ impl TestContext {
             .unwrap()
     }
 
+    pub async fn runner_substreams(
+        &self,
+        stop_block: BlockPtr,
+    ) -> graph_core::SubgraphRunner<
+        graph_chain_substreams::Chain,
+        RuntimeHostBuilder<graph_chain_substreams::Chain>,
+    > {
+        let (logger, deployment, raw) = self.get_runner_context().await;
+        let tp: Box<dyn TriggerProcessor<_, _>> = Box::new(
+            graph_chain_substreams::TriggerProcessor::new(deployment.clone()),
+        );
+
+        self.instance_manager
+            .build_subgraph_runner(
+                logger,
+                self.env_vars.cheap_clone(),
+                deployment,
+                raw,
+                Some(stop_block.block_number()),
+                tp,
+            )
+            .await
+            .unwrap()
+    }
+
+    pub async fn get_runner_context(&self) -> (Logger, DeploymentLocator, serde_yaml::Mapping) {
+        let logger = self.logger.cheap_clone();
+        let deployment = self.deployment.cheap_clone();
+
+        // Stolen from the IPFS provider, there's prolly a nicer way to re-use it
+        let file_bytes = self
+            .link_resolver
+            .cat(&logger, &deployment.hash.to_ipfs_link())
+            .await
+            .unwrap();
+
+        let raw: serde_yaml::Mapping = serde_yaml::from_slice(&file_bytes).unwrap();
+
+        (logger, deployment, raw)
+    }
+
     pub async fn start_and_sync_to(&self, stop_block: BlockPtr) {
         // In case the subgraph has been previously started.
         self.provider.stop(self.deployment.clone()).await.unwrap();
@@ -172,6 +270,8 @@ impl TestContext {
             .start(self.deployment.clone(), Some(stop_block.number))
             .await
             .expect("unable to start subgraph");
+
+        debug!(self.logger, "TEST: syncing to {}", stop_block.number);
 
         wait_for_sync(
             &self.logger,
@@ -204,11 +304,7 @@ impl TestContext {
 
     pub async fn query(&self, query: &str) -> Result<Option<r::Value>, Vec<QueryError>> {
         let target = QueryTarget::Deployment(self.deployment.hash.clone(), ApiVersion::default());
-        let query = Query::new(
-            graphql_parser::parse_query(query).unwrap().into_static(),
-            None,
-            false,
-        );
+        let query = Query::new(q::parse_query(query).unwrap().into_static(), None, false);
         let query_res = self.graphql_runner.clone().run_query(query, target).await;
         query_res.first().unwrap().duplicate().to_result()
     }
@@ -232,7 +328,7 @@ impl TestContext {
             &self.subgraph_name
         );
         let body = json!({ "query": query }).to_string();
-        let req = hyper::Request::new(body.into());
+        let req: Request<Full<Bytes>> = Request::new(body.into());
         let res = self.indexing_status_service.handle_graphql_query(req).await;
         let value = res
             .unwrap()
@@ -275,7 +371,11 @@ graph::prelude::lazy_static! {
     pub static ref STORE_MUTEX: Mutex<()> = Mutex::new(());
 }
 
-pub async fn stores(store_config_path: &str) -> Stores {
+fn test_logger(test_name: &str) -> Logger {
+    graph::log::logger(true).new(o!("test" => test_name.to_string()))
+}
+
+pub async fn stores(test_name: &str, store_config_path: &str) -> Stores {
     let _mutex_guard = STORE_MUTEX.lock().unwrap();
 
     let config = {
@@ -292,7 +392,7 @@ pub async fn stores(store_config_path: &str) -> Stores {
         Config::from_str(&config, "default").expect("failed to create configuration")
     };
 
-    let logger = graph::log::logger(true);
+    let logger = test_logger(test_name);
     let mock_registry: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     let node_id = NodeId::new(NODE_ID).unwrap();
     let store_builder =
@@ -323,11 +423,17 @@ pub async fn stores(store_config_path: &str) -> Stores {
     }
 }
 
+pub struct TestInfo {
+    pub test_dir: String,
+    pub test_name: String,
+    pub subgraph_name: SubgraphName,
+    pub hash: DeploymentHash,
+}
+
 pub async fn setup<C: Blockchain>(
-    subgraph_name: SubgraphName,
-    hash: &DeploymentHash,
+    test_info: &TestInfo,
     stores: &Stores,
-    chain: &TestChain<C>,
+    chain: &impl TestChainTrait<C>,
     graft_block: Option<BlockPtr>,
     env_vars: Option<EnvVars>,
 ) -> TestContext {
@@ -336,28 +442,28 @@ pub async fn setup<C: Blockchain>(
         None => EnvVars::from_env().unwrap(),
     });
 
-    let logger = graph::log::logger(true);
+    let logger = test_logger(&test_info.test_name);
     let mock_registry: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     let logger_factory = LoggerFactory::new(logger.clone(), None, mock_registry.clone());
     let node_id = NodeId::new(NODE_ID).unwrap();
 
     // Make sure we're starting from a clean state.
     let subgraph_store = stores.network_store.subgraph_store();
-    cleanup(&subgraph_store, &subgraph_name, hash).unwrap();
+    cleanup(&subgraph_store, &test_info.subgraph_name, &test_info.hash).unwrap();
 
     let mut blockchain_map = BlockchainMap::new();
-    blockchain_map.insert(stores.network_name.clone(), chain.chain.clone());
+    blockchain_map.insert(stores.network_name.clone(), chain.chain());
 
     let static_filters = env_vars.experimental_static_filters;
 
     let ipfs = IpfsClient::localhost();
-    let link_resolver = Arc::new(LinkResolver::new(
+    let link_resolver = Arc::new(IpfsResolver::new(
         vec![ipfs.cheap_clone()],
         Default::default(),
     ));
     let ipfs_service = ipfs_service(
         ipfs.cheap_clone(),
-        env_vars.mappings.max_ipfs_file_bytes as u64,
+        env_vars.mappings.max_ipfs_file_bytes,
         env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
     );
@@ -365,7 +471,6 @@ pub async fn setup<C: Blockchain>(
     let arweave_resolver = Arc::new(ArweaveClient::default());
     let arweave_service = arweave_service(
         arweave_resolver.cheap_clone(),
-        env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
         match env_vars.mappings.max_ipfs_file_bytes {
             0 => FileSizeLimit::Unlimited,
@@ -402,7 +507,6 @@ pub async fn setup<C: Blockchain>(
     let indexing_status_service = Arc::new(IndexNodeService::new(
         logger.cheap_clone(),
         blockchain_map.cheap_clone(),
-        graphql_runner.cheap_clone(),
         stores.network_store.cheap_clone(),
         link_resolver.cheap_clone(),
     ));
@@ -429,14 +533,17 @@ pub async fn setup<C: Blockchain>(
         Arc::new(Settings::default()),
     ));
 
-    SubgraphRegistrar::create_subgraph(subgraph_registrar.as_ref(), subgraph_name.clone())
-        .await
-        .expect("unable to create subgraph");
+    SubgraphRegistrar::create_subgraph(
+        subgraph_registrar.as_ref(),
+        test_info.subgraph_name.clone(),
+    )
+    .await
+    .expect("unable to create subgraph");
 
     let deployment = SubgraphRegistrar::create_subgraph_version(
         subgraph_registrar.as_ref(),
-        subgraph_name.clone(),
-        hash.clone(),
+        test_info.subgraph_name.clone(),
+        test_info.hash.clone(),
         node_id.clone(),
         None,
         None,
@@ -453,7 +560,7 @@ pub async fn setup<C: Blockchain>(
         provider: subgraph_provider,
         store: subgraph_store,
         deployment,
-        subgraph_name,
+        subgraph_name: test_info.subgraph_name.clone(),
         graphql_runner,
         instance_manager: subgraph_instance_manager,
         link_resolver,
@@ -483,6 +590,17 @@ pub async fn wait_for_sync(
     deployment: &DeploymentLocator,
     stop_block: BlockPtr,
 ) -> Result<(), SubgraphError> {
+    // We wait one second between checks for the subgraph to sync. That
+    // means we wait up to a 30 seconds here by default.
+    lazy_static! {
+        static ref MAX_WAIT: Duration = Duration::from_secs(
+            std::env::var("RUNNER_TESTS_WAIT_FOR_SYNC_SECS")
+                .map(|val| val.parse().unwrap())
+                .unwrap_or(30)
+        );
+    }
+    const WAIT_TIME: Duration = Duration::from_secs(1);
+
     /// We flush here to speed up how long the write queue waits before it
     /// considers a batch complete and writable. Without flushing, we would
     /// have to wait for `GRAPH_STORE_WRITE_BATCH_DURATION` before all
@@ -498,19 +616,18 @@ pub async fn wait_for_sync(
             .unwrap();
     }
 
-    let mut err_count = 0;
+    let start = Instant::now();
 
     flush(logger, &store, deployment).await;
 
-    while err_count < 10 {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+    while start.elapsed() < *MAX_WAIT {
+        tokio::time::sleep(WAIT_TIME).await;
         flush(logger, &store, deployment).await;
 
         let block_ptr = match store.least_block_ptr(&deployment.hash).await {
             Ok(Some(ptr)) => ptr,
             res => {
                 info!(&logger, "{:?}", res);
-                err_count += 1;
                 continue;
             }
         };
@@ -518,18 +635,18 @@ pub async fn wait_for_sync(
         let status = store.status_for_id(deployment.id);
 
         if let Some(fatal_error) = status.fatal_error {
-            if fatal_error.block_ptr.as_ref().unwrap() == &stop_block {
-                return Err(fatal_error);
-            }
+            return Err(fatal_error);
         }
 
         if block_ptr == stop_block {
             info!(logger, "TEST: reached stop block");
-            break;
+            return Ok(());
         }
     }
 
-    Ok(())
+    // We only get here if we timed out waiting for the subgraph to reach
+    // the stop block
+    panic!("Sync did not complete within {}s", MAX_WAIT.as_secs());
 }
 
 struct StaticBlockRefetcher<C: Blockchain> {
@@ -669,7 +786,7 @@ where
 }
 
 struct StaticStream<C: Blockchain> {
-    stream: Pin<Box<dyn Stream<Item = Result<BlockStreamEvent<C>, Error>> + Send>>,
+    stream: Pin<Box<dyn Stream<Item = Result<BlockStreamEvent<C>, BlockStreamError>> + Send>>,
 }
 
 impl<C: Blockchain> BlockStream<C> for StaticStream<C> {
@@ -679,7 +796,7 @@ impl<C: Blockchain> BlockStream<C> for StaticStream<C> {
 }
 
 impl<C: Blockchain> Stream for StaticStream<C> {
-    type Item = Result<BlockStreamEvent<C>, Error>;
+    type Item = Result<BlockStreamEvent<C>, BlockStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.stream.poll_next_unpin(cx)
@@ -689,32 +806,49 @@ impl<C: Blockchain> Stream for StaticStream<C> {
 fn stream_events<C: Blockchain>(
     blocks: Vec<BlockWithTriggers<C>>,
     current_idx: Option<usize>,
-) -> impl Stream<Item = Result<BlockStreamEvent<C>, Error>>
+) -> impl Stream<Item = Result<BlockStreamEvent<C>, BlockStreamError>>
 where
     C::TriggerData: Clone,
 {
+    struct ForkDb<B: Block> {
+        blocks: HashMap<BlockPtr, B>,
+    }
+
+    impl<B: Block> ForkDb<B> {
+        fn common_ancestor(&self, a: BlockPtr, b: BlockPtr) -> Option<&B> {
+            let mut a = self.blocks.get(&a).unwrap();
+            let mut b = self.blocks.get(&b).unwrap();
+            while a.number() > b.number() {
+                a = self.blocks.get(&a.parent_ptr()?).unwrap();
+            }
+            while b.number() > a.number() {
+                b = self.blocks.get(&b.parent_ptr()?).unwrap();
+            }
+            while a.hash() != b.hash() {
+                a = self.blocks.get(&a.parent_ptr()?).unwrap();
+                b = self.blocks.get(&b.parent_ptr()?).unwrap();
+            }
+            Some(a)
+        }
+    }
+
+    let fork_db = ForkDb {
+        blocks: blocks.iter().map(|b| (b.ptr(), b.block.clone())).collect(),
+    };
+
     // See also: static-stream-builder
     stream! {
-        let current_block = current_idx.map(|idx| &blocks[idx]);
-        let mut current_ptr = current_block.map(|b| b.ptr());
-        let mut current_parent_ptr = current_block.and_then(|b| b.parent_ptr());
+        let mut current_ptr = current_idx.map(|idx| blocks[idx].ptr());
         let skip = current_idx.map(|idx| idx + 1).unwrap_or(0);
         let mut blocks_iter = blocks.iter().skip(skip).peekable();
         while let Some(&block) = blocks_iter.peek() {
             if block.parent_ptr() == current_ptr {
                 current_ptr = Some(block.ptr());
-                current_parent_ptr = block.parent_ptr();
                 blocks_iter.next(); // Block consumed, advance the iterator.
                 yield Ok(BlockStreamEvent::ProcessBlock(block.clone(), FirehoseCursor::None));
             } else {
-                let revert_to = current_parent_ptr.unwrap();
+                let revert_to = fork_db.common_ancestor(block.ptr(), current_ptr.unwrap()).unwrap().ptr();
                 current_ptr = Some(revert_to.clone());
-                current_parent_ptr = blocks
-                    .iter()
-                    .find(|b| b.ptr() == revert_to)
-                    .unwrap()
-                    .block
-                    .parent_ptr();
                 yield Ok(BlockStreamEvent::Revert(revert_to, FirehoseCursor::None));
             }
         }
@@ -731,6 +865,19 @@ impl<C: Blockchain> RuntimeAdapter<C> for NoopRuntimeAdapter<C> {
         _ds: &<C as Blockchain>::DataSource,
     ) -> Result<Vec<graph::blockchain::HostFn>, Error> {
         Ok(vec![])
+    }
+}
+
+struct NoopRuntimeAdapterBuilder {}
+
+impl RuntimeAdapterBuilder for NoopRuntimeAdapterBuilder {
+    fn build(
+        &self,
+        _: Arc<EthereumNetworkAdapters>,
+        _: Arc<dyn EthereumCallCache + 'static>,
+        _: Arc<ChainIdentifier>,
+    ) -> Arc<dyn graph::blockchain::RuntimeAdapter<graph_chain_ethereum::Chain> + 'static> {
+        Arc::new(NoopRuntimeAdapter { x: PhantomData })
     }
 }
 

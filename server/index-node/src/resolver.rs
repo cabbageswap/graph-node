@@ -8,11 +8,12 @@ use web3::types::Address;
 
 use git_testament::{git_testament, CommitKind};
 use graph::blockchain::{Blockchain, BlockchainKind, BlockchainMap};
-use graph::components::store::{BlockPtrForNumber, BlockStore, Store};
+use graph::components::store::{BlockPtrForNumber, BlockStore, QueryPermit, Store};
 use graph::components::versions::VERSIONS;
 use graph::data::graphql::{object, IntoValue, ObjectOrInterface, ValueMap};
-use graph::data::subgraph::status;
+use graph::data::subgraph::{status, DeploymentFeatures};
 use graph::data::value::Object;
+use graph::futures03::TryFutureExt;
 use graph::prelude::*;
 use graph_graphql::prelude::{a, ExecutionContext, Resolver};
 
@@ -186,7 +187,7 @@ impl<S: Store> IndexNodeResolver<S> {
         Ok(entity_changes_to_graphql(entity_changes))
     }
 
-    fn resolve_block_data(&self, field: &a::Field) -> Result<r::Value, QueryExecutionError> {
+    async fn resolve_block_data(&self, field: &a::Field) -> Result<r::Value, QueryExecutionError> {
         let network = field
             .get_required::<String>("network")
             .expect("Valid network required");
@@ -207,7 +208,7 @@ impl<S: Store> IndexNodeResolver<S> {
             return Ok(r::Value::Null);
         };
 
-        let blocks_res = chain_store.blocks(&[block_hash.cheap_clone()]);
+        let blocks_res = chain_store.blocks(vec![block_hash.cheap_clone()]).await;
         Ok(match blocks_res {
             Ok(blocks) if blocks.is_empty() => {
                 error!(
@@ -282,7 +283,7 @@ impl<S: Store> IndexNodeResolver<S> {
         let call_cache = chain.call_cache();
 
         let (block_number, timestamp) = match chain_store.block_number(&block_hash).await {
-            Ok(Some((_, n, timestamp))) => (n, timestamp),
+            Ok(Some((_, n, timestamp, _))) => (n, timestamp),
             Ok(None) => {
                 error!(
                     self.logger,
@@ -369,7 +370,7 @@ impl<S: Store> IndexNodeResolver<S> {
         let poi_fut = self
             .store
             .get_proof_of_indexing(&deployment_id, &indexer, block.clone());
-        let poi = match futures::executor::block_on(poi_fut) {
+        let poi = match graph::futures03::executor::block_on(poi_fut) {
             Ok(Some(poi)) => r::Value::String(format!("0x{}", hex::encode(poi))),
             Ok(None) => r::Value::Null,
             Err(e) => {
@@ -468,6 +469,150 @@ impl<S: Store> IndexNodeResolver<S> {
             .unwrap_or(r::Value::Null))
     }
 
+    async fn validate_and_extract_features<C, SgStore>(
+        subgraph_store: &Arc<SgStore>,
+        unvalidated_subgraph_manifest: UnvalidatedSubgraphManifest<C>,
+    ) -> Result<DeploymentFeatures, QueryExecutionError>
+    where
+        C: Blockchain,
+        SgStore: SubgraphStore,
+    {
+        match unvalidated_subgraph_manifest
+            .validate(subgraph_store.clone(), false)
+            .await
+        {
+            Ok(subgraph_manifest) => Ok(subgraph_manifest.deployment_features()),
+            Err(_) => Err(QueryExecutionError::InvalidSubgraphManifest),
+        }
+    }
+
+    async fn get_features_from_ipfs(
+        &self,
+        deployment_hash: &DeploymentHash,
+    ) -> Result<DeploymentFeatures, QueryExecutionError> {
+        let raw_yaml: serde_yaml::Mapping = {
+            let file_bytes = self
+                .link_resolver
+                .cat(&self.logger, &deployment_hash.to_ipfs_link())
+                .await
+                .map_err(SubgraphManifestResolveError::ResolveError)?;
+
+            serde_yaml::from_slice(&file_bytes).map_err(SubgraphManifestResolveError::ParseError)?
+        };
+
+        let kind = BlockchainKind::from_manifest(&raw_yaml)
+            .map_err(SubgraphManifestResolveError::ResolveError)?;
+
+        let max_spec_version = ENV_VARS.max_spec_version.clone();
+
+        let result = match kind {
+            BlockchainKind::Ethereum => {
+                let unvalidated_subgraph_manifest =
+                    UnvalidatedSubgraphManifest::<graph_chain_ethereum::Chain>::resolve(
+                        deployment_hash.clone(),
+                        raw_yaml,
+                        &self.link_resolver,
+                        &self.logger,
+                        max_spec_version,
+                    )
+                    .await?;
+
+                Self::validate_and_extract_features(
+                    &self.store.subgraph_store(),
+                    unvalidated_subgraph_manifest,
+                )
+                .await?
+            }
+            BlockchainKind::Cosmos => {
+                let unvalidated_subgraph_manifest =
+                    UnvalidatedSubgraphManifest::<graph_chain_cosmos::Chain>::resolve(
+                        deployment_hash.clone(),
+                        raw_yaml,
+                        &self.link_resolver,
+                        &self.logger,
+                        max_spec_version,
+                    )
+                    .await?;
+
+                Self::validate_and_extract_features(
+                    &self.store.subgraph_store(),
+                    unvalidated_subgraph_manifest,
+                )
+                .await?
+            }
+            BlockchainKind::Near => {
+                let unvalidated_subgraph_manifest =
+                    UnvalidatedSubgraphManifest::<graph_chain_near::Chain>::resolve(
+                        deployment_hash.clone(),
+                        raw_yaml,
+                        &self.link_resolver,
+                        &self.logger,
+                        max_spec_version,
+                    )
+                    .await?;
+
+                Self::validate_and_extract_features(
+                    &self.store.subgraph_store(),
+                    unvalidated_subgraph_manifest,
+                )
+                .await?
+            }
+            BlockchainKind::Arweave => {
+                let unvalidated_subgraph_manifest =
+                    UnvalidatedSubgraphManifest::<graph_chain_arweave::Chain>::resolve(
+                        deployment_hash.clone(),
+                        raw_yaml,
+                        &self.link_resolver,
+                        &self.logger,
+                        max_spec_version,
+                    )
+                    .await?;
+
+                Self::validate_and_extract_features(
+                    &self.store.subgraph_store(),
+                    unvalidated_subgraph_manifest,
+                )
+                .await?
+            }
+            BlockchainKind::Substreams => {
+                let unvalidated_subgraph_manifest =
+                    UnvalidatedSubgraphManifest::<graph_chain_substreams::Chain>::resolve(
+                        deployment_hash.clone(),
+                        raw_yaml,
+                        &self.link_resolver,
+                        &self.logger,
+                        max_spec_version,
+                    )
+                    .await?;
+
+                Self::validate_and_extract_features(
+                    &self.store.subgraph_store(),
+                    unvalidated_subgraph_manifest,
+                )
+                .await?
+            }
+            BlockchainKind::Starknet => {
+                let unvalidated_subgraph_manifest =
+                    UnvalidatedSubgraphManifest::<graph_chain_substreams::Chain>::resolve(
+                        deployment_hash.clone(),
+                        raw_yaml,
+                        &self.link_resolver,
+                        &self.logger,
+                        max_spec_version,
+                    )
+                    .await?;
+
+                Self::validate_and_extract_features(
+                    &self.store.subgraph_store(),
+                    unvalidated_subgraph_manifest,
+                )
+                .await?
+            }
+        };
+
+        Ok(result)
+    }
+
     async fn resolve_subgraph_features(
         &self,
         field: &a::Field,
@@ -481,9 +626,12 @@ impl<S: Store> IndexNodeResolver<S> {
         })?;
 
         let subgraph_store = self.store.subgraph_store();
-        let deployment_features = subgraph_store.subgraph_features(&deployment_hash).await?;
+        let features = match subgraph_store.subgraph_features(&deployment_hash).await? {
+            Some(features) => features,
+            None => self.get_features_from_ipfs(&deployment_hash).await?,
+        };
 
-        Ok(deployment_features.into_value())
+        Ok(features.into_value())
     }
 
     fn resolve_api_versions(&self, _field: &a::Field) -> Result<r::Value, QueryExecutionError> {
@@ -552,6 +700,7 @@ impl<S: Store> IndexNodeResolver<S> {
         try_resolve_for_chain!(graph_chain_arweave::Chain);
         try_resolve_for_chain!(graph_chain_cosmos::Chain);
         try_resolve_for_chain!(graph_chain_near::Chain);
+        try_resolve_for_chain!(graph_chain_starknet::Chain);
 
         // If you're adding support for a new chain and this `match` clause just
         // gave you a compiler error, then this message is for you! You need to
@@ -563,7 +712,8 @@ impl<S: Store> IndexNodeResolver<S> {
             | BlockchainKind::Arweave
             | BlockchainKind::Ethereum
             | BlockchainKind::Cosmos
-            | BlockchainKind::Near => (),
+            | BlockchainKind::Near
+            | BlockchainKind::Starknet => (),
         }
 
         // The given network does not exist.
@@ -648,7 +798,7 @@ fn entity_changes_to_graphql(entity_changes: Vec<EntityOperation>) -> r::Value {
 impl<S: Store> Resolver for IndexNodeResolver<S> {
     const CACHEABLE: bool = false;
 
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError> {
+    async fn query_permit(&self) -> Result<QueryPermit, QueryExecutionError> {
         self.store.query_permit().await.map_err(Into::into)
     }
 
@@ -674,7 +824,7 @@ impl<S: Store> Resolver for IndexNodeResolver<S> {
             scalar_type.name.as_str(),
         ) {
             ("Query", "proofOfIndexing", "Bytes") => self.resolve_proof_of_indexing(field),
-            ("Query", "blockData", "JSONObject") => self.resolve_block_data(field),
+            ("Query", "blockData", "JSONObject") => self.resolve_block_data(field).await,
             ("Query", "blockHashFromNumber", "Bytes") => {
                 self.resolve_block_hash_from_number(field).await
             }

@@ -1,12 +1,12 @@
 use crate::config::{Config, ProviderDetails};
 use ethereum::{EthereumNetworks, ProviderEthRpcMetrics};
-use futures::future::{join_all, try_join_all};
-use futures::TryFutureExt;
 use graph::anyhow::{bail, Error};
 use graph::blockchain::{Block as BlockchainBlock, BlockchainKind, ChainIdentifier};
 use graph::cheap_clone::CheapClone;
 use graph::endpoint::EndpointMetrics;
 use graph::firehose::{FirehoseEndpoint, FirehoseNetworks, SubgraphLimit};
+use graph::futures03::future::{join_all, try_join_all};
+use graph::futures03::TryFutureExt;
 use graph::ipfs_client::IpfsClient;
 use graph::prelude::{anyhow, tokio};
 use graph::prelude::{prost, MetricsRegistry};
@@ -140,6 +140,7 @@ pub fn create_substreams_networks(
                             &provider.label,
                             &firehose.url,
                             firehose.token.clone(),
+                            firehose.key.clone(),
                             firehose.filters_enabled(),
                             firehose.compression_enabled(),
                             SubgraphLimit::Unlimited,
@@ -196,6 +197,7 @@ pub fn create_firehose_networks(
                             &provider.label,
                             &firehose.url,
                             firehose.token.clone(),
+                            firehose.key.clone(),
                             firehose.filters_enabled(),
                             firehose.compression_enabled(),
                             firehose.limit_for(&config.node),

@@ -4,7 +4,7 @@ use diesel::result::QueryResult;
 ///! Utilities to deal with block numbers and block ranges
 use diesel::serialize::{Output, ToSql};
 use diesel::sql_types::{Integer, Range};
-use std::io::Write;
+use graph::env::ENV_VARS;
 use std::ops::{Bound, RangeBounds, RangeFrom};
 
 use graph::prelude::{lazy_static, BlockNumber, BlockPtr, BLOCK_NUMBER_MAX};
@@ -13,7 +13,7 @@ use crate::relational::{SqlName, Table};
 
 /// The name of the column in which we store the block range for mutable
 /// entities
-pub(crate) const BLOCK_RANGE_COLUMN: &str = "block_range";
+pub const BLOCK_RANGE_COLUMN: &str = "block_range";
 
 /// The name of the column that stores the causality region of an entity.
 pub(crate) const CAUSALITY_REGION_COLUMN: &str = "causality_region";
@@ -88,20 +88,20 @@ impl From<std::ops::Range<BlockNumber>> for BlockRange {
 }
 
 impl ToSql<Range<Integer>, Pg> for BlockRange {
-    fn to_sql<W: Write>(&self, out: &mut Output<W, Pg>) -> diesel::serialize::Result {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> diesel::serialize::Result {
         let pair = (self.0, self.1);
-        ToSql::<Range<Integer>, Pg>::to_sql(&pair, out)
+        ToSql::<Range<Integer>, Pg>::to_sql(&pair, &mut out.reborrow())
     }
 }
 
-#[derive(Constructor)]
+#[derive(Debug, Constructor)]
 pub struct BlockRangeLowerBoundClause<'a> {
     _table_prefix: &'a str,
     block: BlockNumber,
 }
 
 impl<'a> QueryFragment<Pg> for BlockRangeLowerBoundClause<'a> {
-    fn walk_ast(&self, mut out: AstPass<Pg>) -> QueryResult<()> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         out.unsafe_to_cache_prepared();
 
         out.push_sql("lower(");
@@ -113,14 +113,14 @@ impl<'a> QueryFragment<Pg> for BlockRangeLowerBoundClause<'a> {
     }
 }
 
-#[derive(Constructor)]
+#[derive(Debug, Constructor)]
 pub struct BlockRangeUpperBoundClause<'a> {
     _table_prefix: &'a str,
     block: BlockNumber,
 }
 
 impl<'a> QueryFragment<Pg> for BlockRangeUpperBoundClause<'a> {
-    fn walk_ast(&self, mut out: AstPass<Pg>) -> QueryResult<()> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         out.unsafe_to_cache_prepared();
 
         out.push_sql("coalesce(upper(");
@@ -164,11 +164,25 @@ impl<'a> BlockRangeColumn<'a> {
             }
         }
     }
+
+    pub fn block(&self) -> BlockNumber {
+        match self {
+            BlockRangeColumn::Mutable { block, .. } => *block,
+            BlockRangeColumn::Immutable { block, .. } => *block,
+        }
+    }
 }
 
 impl<'a> BlockRangeColumn<'a> {
-    /// Output SQL that matches only rows whose block range contains `block`
-    pub fn contains(&self, out: &mut AstPass<Pg>) -> QueryResult<()> {
+    /// Output SQL that matches only rows whose block range contains `block`.
+    ///
+    /// `filters_by_id` has no impact on correctness. It is a heuristic to determine
+    /// whether the brin index should be used. If `true`, the brin index is not used.
+    pub fn contains<'b>(
+        &'b self,
+        out: &mut AstPass<'_, 'b, Pg>,
+        filters_by_id: bool,
+    ) -> QueryResult<()> {
         out.unsafe_to_cache_prepared();
 
         match self {
@@ -176,11 +190,16 @@ impl<'a> BlockRangeColumn<'a> {
                 self.name(out);
                 out.push_sql(" @> ");
                 out.push_bind_param::<Integer, _>(block)?;
-                if table.is_account_like && *block < BLOCK_NUMBER_MAX {
+
+                let should_use_brin = !filters_by_id || ENV_VARS.store.use_brin_for_all_query_types;
+                if table.is_account_like && *block < BLOCK_NUMBER_MAX && should_use_brin {
                     // When block is BLOCK_NUMBER_MAX, these checks would be wrong; we
                     // don't worry about adding the equivalent in that case since
                     // we generally only see BLOCK_NUMBER_MAX here for metadata
-                    // queries where block ranges don't matter anyway
+                    // queries where block ranges don't matter anyway.
+                    //
+                    // We also don't need to add these if the query already filters by ID,
+                    // because the ideal index is the GiST index on id and block_range.
                     out.push_sql(" and coalesce(upper(");
                     out.push_identifier(BLOCK_RANGE_COLUMN)?;
                     out.push_sql("), 2147483647) > ");
@@ -243,7 +262,7 @@ impl<'a> BlockRangeColumn<'a> {
     /// # Panics
     ///
     /// If the underlying table is immutable, this method will panic
-    pub fn clamp(&self, out: &mut AstPass<Pg>) -> QueryResult<()> {
+    pub fn clamp<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         match self {
             BlockRangeColumn::Mutable { block, .. } => {
                 self.name(out);
@@ -270,7 +289,7 @@ impl<'a> BlockRangeColumn<'a> {
 
     /// Output an expression that matches all rows that have been changed
     /// after `block` (inclusive)
-    pub(crate) fn changed_since(&self, out: &mut AstPass<Pg>) -> QueryResult<()> {
+    pub(crate) fn changed_since<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         match self {
             BlockRangeColumn::Mutable { block, .. } => {
                 out.push_sql("lower(");
@@ -284,6 +303,41 @@ impl<'a> BlockRangeColumn<'a> {
                 out.push_bind_param::<Integer, _>(block)
             }
         }
+    }
+}
+
+/// The value for the block/block_range column, mostly as a tool for
+/// inserting data
+#[derive(Debug)]
+pub enum BlockRangeValue {
+    Immutable(BlockNumber),
+    Mutable(BlockRange),
+}
+
+impl BlockRangeValue {
+    pub fn new(table: &Table, block: BlockNumber, end: Option<BlockNumber>) -> Self {
+        if table.immutable {
+            BlockRangeValue::Immutable(block)
+        } else {
+            match end {
+                Some(e) => BlockRangeValue::Mutable((block..e).into()),
+                None => BlockRangeValue::Mutable((block..).into()),
+            }
+        }
+    }
+}
+
+impl QueryFragment<Pg> for BlockRangeValue {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        match self {
+            BlockRangeValue::Immutable(block) => {
+                out.push_bind_param::<Integer, _>(block)?;
+            }
+            BlockRangeValue::Mutable(range) => {
+                out.push_bind_param::<Range<Integer>, _>(range)?;
+            }
+        }
+        Ok(())
     }
 }
 

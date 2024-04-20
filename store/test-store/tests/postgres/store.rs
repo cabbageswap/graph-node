@@ -1,7 +1,10 @@
 use graph::blockchain::block_stream::FirehoseCursor;
+use graph::blockchain::BlockTime;
 use graph::data::graphql::ext::TypeDefinitionExt;
 use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::DeploymentCreate;
+use graph::futures01::{future, Stream};
+use graph::futures03::compat::Future01CompatExt;
 use graph::schema::{EntityType, InputSchema};
 use graph_chain_ethereum::{Mapping, MappingABI};
 use hex_literal::hex;
@@ -66,7 +69,7 @@ lazy_static! {
     static ref TEST_SUBGRAPH_ID: DeploymentHash =
         DeploymentHash::new(TEST_SUBGRAPH_ID_STRING.as_str()).unwrap();
     static ref TEST_SUBGRAPH_SCHEMA: InputSchema =
-        InputSchema::parse(USER_GQL, TEST_SUBGRAPH_ID.clone())
+        InputSchema::parse_latest(USER_GQL, TEST_SUBGRAPH_ID.clone())
             .expect("Failed to parse user schema");
     static ref TEST_BLOCK_0_PTR: BlockPtr = (
         H256::from(hex!(
@@ -170,6 +173,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         graft: None,
         templates: vec![],
         chain: PhantomData,
+        indexer_hints: None,
     };
 
     // Create SubgraphDeploymentEntity
@@ -1117,6 +1121,7 @@ fn mock_data_source() -> graph_chain_ethereum::DataSource {
         network: Some(String::from("mainnet")),
         address: Some(Address::from_str("0123123123012312312301231231230123123123").unwrap()),
         start_block: 0,
+        end_block: None,
         mapping: Mapping {
             kind: String::from("ethereum/events"),
             api_version: Version::parse("0.1.0").unwrap(),
@@ -1247,8 +1252,8 @@ fn revert_block_with_dynamic_data_source_operations() {
 fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
     run_test(|store, _, _| async move {
         let subgraph_id = DeploymentHash::new("EntityChangeTestSubgraph").unwrap();
-        let schema =
-            InputSchema::parse(USER_GQL, subgraph_id.clone()).expect("Failed to parse user schema");
+        let schema = InputSchema::parse_latest(USER_GQL, subgraph_id.clone())
+            .expect("Failed to parse user schema");
         let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
             id: subgraph_id.clone(),
             spec_version: Version::new(1, 0, 0),
@@ -1260,6 +1265,7 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             graft: None,
             templates: vec![],
             chain: PhantomData,
+            indexer_hints: None,
         };
 
         let deployment =
@@ -1522,12 +1528,14 @@ fn handle_large_string_with_index() {
             deployment.hash.clone(),
             "test",
             metrics_registry.clone(),
+            "test_shard".to_string(),
         );
 
         let block = TEST_BLOCK_3_PTR.number;
         writable
             .transact_block_operations(
                 TEST_BLOCK_3_PTR.clone(),
+                BlockTime::for_test(&*TEST_BLOCK_3_PTR),
                 FirehoseCursor::None,
                 vec![
                     make_insert_op(ONE, &long_text, &schema, block),
@@ -1537,6 +1545,7 @@ fn handle_large_string_with_index() {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                false,
                 false,
             )
             .await
@@ -1623,12 +1632,14 @@ fn handle_large_bytea_with_index() {
             deployment.hash.clone(),
             "test",
             metrics_registry.clone(),
+            "test_shard".to_string(),
         );
 
         let block = TEST_BLOCK_3_PTR.number;
         writable
             .transact_block_operations(
                 TEST_BLOCK_3_PTR.clone(),
+                BlockTime::for_test(&*TEST_BLOCK_3_PTR),
                 FirehoseCursor::None,
                 vec![
                     make_insert_op(ONE, &long_bytea, &schema, block),
@@ -1638,6 +1649,7 @@ fn handle_large_bytea_with_index() {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                false,
                 false,
             )
             .await
@@ -1941,7 +1953,8 @@ fn cleanup_cached_blocks() {
         block_store::set_chain(
             vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_TWO, &*BLOCK_THREE],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
@@ -1972,13 +1985,14 @@ fn parse_timestamp() {
                 &*BLOCK_THREE_TIMESTAMP,
             ],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
             .expect("fake chain store");
 
-        let (_network, number, timestamp) = chain_store
+        let (_network, number, timestamp, _) = chain_store
             .block_number(&BLOCK_THREE_TIMESTAMP.block_hash())
             .await
             .expect("block_number to return correct number and timestamp")
@@ -2005,13 +2019,14 @@ fn parse_timestamp_firehose() {
                 &*BLOCK_THREE_TIMESTAMP_FIREHOSE,
             ],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
             .expect("fake chain store");
 
-        let (_network, number, timestamp) = chain_store
+        let (_network, number, timestamp, _) = chain_store
             .block_number(&BLOCK_THREE_TIMESTAMP_FIREHOSE.block_hash())
             .await
             .expect("block_number to return correct number and timestamp")
@@ -2038,13 +2053,14 @@ fn parse_null_timestamp() {
                 &*BLOCK_THREE_NO_TIMESTAMP,
             ],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
             .expect("fake chain store");
 
-        let (_network, number, timestamp) = chain_store
+        let (_network, number, timestamp, _) = chain_store
             .block_number(&BLOCK_THREE_NO_TIMESTAMP.block_hash())
             .await
             .expect("block_number to return correct number and timestamp")

@@ -1,11 +1,10 @@
-use futures::prelude::*;
-
 use crate::data::query::QueryResults;
 use crate::data::query::{Query, QueryTarget};
 use crate::data::subscription::{Subscription, SubscriptionError, SubscriptionResult};
 use crate::prelude::DeploymentHash;
 
 use async_trait::async_trait;
+use futures01::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,4 +48,5 @@ pub trait GraphQLMetrics: Send + Sync + 'static {
     fn observe_query_parsing(&self, duration: Duration, results: &QueryResults);
     fn observe_query_validation(&self, duration: Duration, id: &DeploymentHash);
     fn observe_query_validation_error(&self, error_codes: Vec<&str>, id: &DeploymentHash);
+    fn observe_query_blocks_behind(&self, blocks_behind: i32, id: &DeploymentHash);
 }

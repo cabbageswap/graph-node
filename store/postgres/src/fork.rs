@@ -8,11 +8,11 @@ use graph::{
     block_on,
     components::store::SubgraphFork as SubgraphForkTrait,
     constraint_violation,
-    data::graphql::ext::DirectiveFinder,
     prelude::{
-        info, r::Value as RValue, reqwest, s::Field, serde_json, DeploymentHash, Entity, Logger,
-        Serialize, StoreError, Value, ValueType,
+        info, r::Value as RValue, reqwest, serde_json, DeploymentHash, Entity, Logger, Serialize,
+        StoreError, Value, ValueType,
     },
+    schema::Field,
     url::Url,
 };
 use graph::{data::value::Word, schema::InputSchema};
@@ -69,7 +69,7 @@ impl SubgraphForkTrait for SubgraphFork {
         let entity_type = self.schema.entity_type(&entity_type_name)?;
         let fields = &entity_type
             .object_type()
-            .ok_or_else(|| {
+            .map_err(|_| {
                 constraint_violation!("no object type called `{}` found", entity_type_name)
             })?
             .fields;
@@ -182,7 +182,7 @@ query Query ($id: String) {{
                     continue;
                 }
 
-                let value = entity.get(&f.name).unwrap().clone();
+                let value = entity.get(f.name.as_str()).unwrap().clone();
                 let value = if let Some(id) = value.get("id") {
                     RValue::String(id.as_str().unwrap().to_string())
                 } else if let Some(list) = value.as_array() {
@@ -230,7 +230,6 @@ mod tests {
         prelude::{s::Type, DeploymentHash},
         slog::{self, o},
     };
-    use graphql_parser::parse_schema;
 
     fn test_base() -> Url {
         Url::parse("https://api.thegraph.com/subgraph/id/").unwrap()
@@ -241,17 +240,14 @@ mod tests {
     }
 
     fn test_schema() -> InputSchema {
-        InputSchema::new(
-            DeploymentHash::new("test").unwrap(),
-            parse_schema::<String>(
-                r#"type Gravatar @entity {
+        InputSchema::parse_latest(
+            r#"type Gravatar @entity {
   id: ID!
   owner: Bytes!
   displayName: String!
   imageUrl: String!
 }"#,
-            )
-            .unwrap(),
+            DeploymentHash::new("test").unwrap(),
         )
         .unwrap()
     }
@@ -260,40 +256,17 @@ mod tests {
         Logger::root(slog::Discard, o!())
     }
 
-    fn test_fields() -> Vec<Field> {
+    fn test_fields(schema: &InputSchema) -> Vec<Field> {
+        fn non_null_type(name: &str) -> Type {
+            Type::NonNullType(Box::new(Type::NamedType(name.to_string())))
+        }
+
+        let schema = schema.schema();
         vec![
-            Field {
-                position: graphql_parser::Pos { line: 2, column: 3 },
-                description: None,
-                name: "id".to_string(),
-                arguments: vec![],
-                field_type: Type::NonNullType(Box::new(Type::NamedType("ID".to_string()))),
-                directives: vec![],
-            },
-            Field {
-                position: graphql_parser::Pos { line: 3, column: 3 },
-                description: None,
-                name: "owner".to_string(),
-                arguments: vec![],
-                field_type: Type::NonNullType(Box::new(Type::NamedType("Bytes".to_string()))),
-                directives: vec![],
-            },
-            Field {
-                position: graphql_parser::Pos { line: 4, column: 3 },
-                description: None,
-                name: "displayName".to_string(),
-                arguments: vec![],
-                field_type: Type::NonNullType(Box::new(Type::NamedType("String".to_string()))),
-                directives: vec![],
-            },
-            Field {
-                position: graphql_parser::Pos { line: 5, column: 3 },
-                description: None,
-                name: "imageUrl".to_string(),
-                arguments: vec![],
-                field_type: Type::NonNullType(Box::new(Type::NamedType("String".to_string()))),
-                directives: vec![],
-            },
+            Field::new(schema, "id", &non_null_type("ID"), None),
+            Field::new(schema, "owner", &non_null_type("Bytes"), None),
+            Field::new(schema, "displayName", &non_null_type("String"), None),
+            Field::new(schema, "imageUrl", &non_null_type("String"), None),
         ]
     }
 
@@ -304,7 +277,7 @@ mod tests {
         let entity_type = schema.entity_type("Gravatar").unwrap();
         let fields = &entity_type.object_type().unwrap().fields;
 
-        assert_eq!(fields, &test_fields());
+        assert_eq!(fields, &test_fields(&schema).into_boxed_slice());
     }
 
     #[test]
@@ -314,10 +287,12 @@ mod tests {
         let schema = test_schema();
         let logger = test_logger();
 
-        let fork = SubgraphFork::new(base, id, schema, logger).unwrap();
+        let fork = SubgraphFork::new(base, id, schema.clone(), logger).unwrap();
 
         let query = Query {
-            query: fork.query_string("Gravatar", &test_fields()).unwrap(),
+            query: fork
+                .query_string("Gravatar", &test_fields(&schema))
+                .unwrap(),
             variables: Variables {
                 id: "0x00".to_string(),
             },
@@ -354,7 +329,7 @@ mod tests {
     }
 }"#,
             "Gravatar",
-            &test_fields(),
+            &test_fields(&schema),
         )
         .unwrap();
 

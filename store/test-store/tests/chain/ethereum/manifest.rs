@@ -1,18 +1,25 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use graph::blockchain::DataSource;
+use graph::components::store::BLOCK_NUMBER_MAX;
+use graph::data::store::scalar::Bytes;
 use graph::data::store::Value;
 use graph::data::subgraph::schema::SubgraphError;
-use graph::data::subgraph::{SPEC_VERSION_0_0_4, SPEC_VERSION_0_0_7, SPEC_VERSION_0_0_8};
+use graph::data::subgraph::{
+    Prune, LATEST_VERSION, SPEC_VERSION_0_0_4, SPEC_VERSION_0_0_7, SPEC_VERSION_0_0_8,
+    SPEC_VERSION_0_0_9, SPEC_VERSION_1_0_0, SPEC_VERSION_1_2_0,
+};
 use graph::data_source::offchain::OffchainDataSourceKind;
 use graph::data_source::DataSourceTemplate;
 use graph::entity;
+use graph::env::ENV_VARS;
 use graph::prelude::{
-    anyhow, async_trait, serde_yaml, tokio, DeploymentHash, Link, Logger, SubgraphManifest,
-    SubgraphManifestValidationError, SubgraphStore, UnvalidatedSubgraphManifest,
+    anyhow, async_trait, serde_yaml, tokio, BigDecimal, BigInt, DeploymentHash, Link, Logger,
+    SubgraphManifest, SubgraphManifestValidationError, SubgraphStore, UnvalidatedSubgraphManifest,
 };
 use graph::{
     blockchain::NodeCapabilities as _,
@@ -181,6 +188,60 @@ specVersion: 0.0.2
     let graft = manifest.graft.expect("The manifest has a graft base");
     assert_eq!("Qmbase", graft.base.as_str());
     assert_eq!(12345, graft.block);
+}
+
+#[tokio::test]
+async fn parse_indexer_hints() {
+    const YAML: &str = "
+dataSources: []
+schema:
+  file:
+    /: /ipfs/Qmschema
+graft:
+  base: Qmbase
+  block: 12345
+specVersion: 1.0.0
+indexerHints:
+  prune: 100
+";
+
+    let manifest = resolve_manifest(YAML, SPEC_VERSION_1_0_0).await;
+
+    assert_eq!(manifest.history_blocks(), 100);
+
+    let yaml: &str = "
+    dataSources: []
+    schema:
+      file:
+        /: /ipfs/Qmschema
+    graft:
+      base: Qmbase
+      block: 12345
+    specVersion: 1.0.0
+    indexerHints:
+      prune: auto
+    ";
+
+    let manifest = resolve_manifest(yaml, SPEC_VERSION_1_0_0).await;
+    Prune::Auto.history_blocks();
+    assert_eq!(manifest.history_blocks(), ENV_VARS.min_history_blocks);
+
+    let yaml: &str = "
+    dataSources: []
+    schema:
+      file:
+        /: /ipfs/Qmschema
+    graft:
+      base: Qmbase
+      block: 12345
+    specVersion: 1.0.0
+    indexerHints:
+      prune: never
+    ";
+
+    let manifest = resolve_manifest(yaml, SPEC_VERSION_1_0_0).await;
+
+    assert_eq!(manifest.history_blocks(), BLOCK_NUMBER_MAX);
 }
 
 #[test]
@@ -387,10 +448,34 @@ dataSources:
     name: Factory
     network: mainnet
     context:
-      foo:
+      bool_example:
+        type: Bool
+        data: true
+      int8_example:
+        type: Int8
+        data: 64
+      big_decimal_example:
+        type: BigDecimal
+        data: 10.99
+      bytes_example:
+        type: Bytes
+        data: \"0x68656c6c6f\"
+      list_example:
+        type: List
+        data:
+          - type: Int
+            data: 1
+          - type: Int
+            data: 2
+          - type: Int
+            data: 3
+      big_int_example:
+        type: BigInt
+        data: \"1000000000000000000000000\"
+      string_example:
         type: String
-        data: bar
-      qux:
+        data: \"bar\"
+      int_example:
         type: Int
         data: 42
     source:
@@ -427,9 +512,42 @@ specVersion: 0.0.8
     let context = data_source.context.as_ref().clone().unwrap();
     let sorted = context.sorted();
 
-    assert_eq!(sorted.len(), 2);
-    assert_eq!(sorted[0], ("foo".into(), Value::String("bar".into())));
-    assert_eq!(sorted[1], ("qux".into(), Value::Int(42)));
+    assert_eq!(sorted.len(), 8);
+    assert_eq!(
+        sorted[0],
+        (
+            "big_decimal_example".into(),
+            Value::BigDecimal(BigDecimal::from(10.99))
+        )
+    );
+    assert_eq!(
+        sorted[1],
+        (
+            "big_int_example".into(),
+            Value::BigInt(BigInt::from_str("1000000000000000000000000").unwrap())
+        )
+    );
+    assert_eq!(sorted[2], ("bool_example".into(), Value::Bool(true)));
+    assert_eq!(
+        sorted[3],
+        (
+            "bytes_example".into(),
+            Value::Bytes(Bytes::from_str("0x68656c6c6f").unwrap())
+        )
+    );
+    assert_eq!(sorted[4], ("int8_example".into(), Value::Int8(64)));
+    assert_eq!(sorted[5], ("int_example".into(), Value::Int(42)));
+    assert_eq!(
+        sorted[6],
+        (
+            "list_example".into(),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        )
+    );
+    assert_eq!(
+        sorted[7],
+        ("string_example".into(), Value::String("bar".into()))
+    );
 }
 
 #[tokio::test]
@@ -474,7 +592,7 @@ specVersion: 0.0.8
         .collect::<Vec<_>>();
 
     let data_source = onchain_data_sources.get(0).unwrap();
-    let validation_errors = data_source.validate();
+    let validation_errors = data_source.validate(&LATEST_VERSION);
     let filter = data_source.mapping.block_handlers[0].filter.clone();
 
     assert_eq!(0, validation_errors.len());
@@ -486,6 +604,43 @@ specVersion: 0.0.8
     );
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
+}
+
+#[tokio::test]
+async fn parse_data_source_with_end_block() {
+    const YAML: &str = "
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    network: mainnet
+    source:
+      abi: Factory
+      startBlock: 9562480
+      endBlock: 9562481
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.4
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      abis:
+        - name: Factory
+          file:
+            /: /ipfs/Qmabi
+schema:
+  file:
+    /: /ipfs/Qmschema
+specVersion: 0.0.9
+";
+
+    let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_9).await;
+    // Check if end block is parsed correctly
+    let data_source = manifest.data_sources.first().unwrap();
+    let end_block = data_source.as_onchain().unwrap().end_block;
+
+    assert_eq!(Some(9562481), end_block);
 }
 
 #[tokio::test]
@@ -533,7 +688,7 @@ specVersion: 0.0.8
         .collect::<Vec<_>>();
 
     let data_source = onchain_data_sources.get(0).unwrap();
-    let validation_errors = data_source.validate();
+    let validation_errors = data_source.validate(LATEST_VERSION);
     let filters = data_source
         .mapping
         .block_handlers
@@ -598,7 +753,7 @@ specVersion: 0.0.8
         .collect::<Vec<_>>();
 
     let data_source = onchain_data_sources.get(0).unwrap();
-    let validation_errors = data_source.validate();
+    let validation_errors = data_source.validate(LATEST_VERSION);
     let filters = data_source
         .mapping
         .block_handlers
@@ -1145,5 +1300,74 @@ schema:
 
         let manifest = resolve_manifest(YAML, SPEC_VERSION_0_0_4).await;
         assert!(manifest.features.contains(&SubgraphFeature::NonFatalErrors))
+    });
+}
+
+#[test]
+fn parses_eth_call_decls() {
+    const YAML: &str = "
+specVersion: 1.2.0
+schema:
+  file:
+    /: /ipfs/Qmschema
+features:
+  - ipfsOnEthereumContracts
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    network: mainnet
+    source:
+      abi: Factory
+      startBlock: 9562480
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.4
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      abis:
+        - name: Factory
+          file:
+            /: /ipfs/Qmabi
+      eventHandlers:
+        - event: Created(address)
+          handler: handleGet
+          calls:
+            fake1: Factory[event.address].get(event.params.address)
+            fake2: Factory[event.params.address].get(event.params.address)
+";
+
+    test_store::run_test_sequentially(|store| async move {
+        let store = store.subgraph_store();
+        let unvalidated: UnvalidatedSubgraphManifest<Chain> = {
+            let mut resolver = TextResolver::default();
+            let id = DeploymentHash::new("Qmmanifest").unwrap();
+            resolver.add(id.as_str(), &YAML);
+            resolver.add("/ipfs/Qmabi", &ABI);
+            resolver.add("/ipfs/Qmschema", &GQL_SCHEMA);
+            resolver.add("/ipfs/Qmmapping", &MAPPING_WITH_IPFS_FUNC_WASM);
+
+            let resolver: Arc<dyn LinkResolverTrait> = Arc::new(resolver);
+
+            let raw = serde_yaml::from_str(YAML).unwrap();
+            UnvalidatedSubgraphManifest::resolve(
+                id,
+                raw,
+                &resolver,
+                &LOGGER,
+                SPEC_VERSION_1_2_0.clone(),
+            )
+            .await
+            .expect("Parsing simple manifest works")
+        };
+
+        let manifest = unvalidated.validate(store.clone(), true).await.unwrap();
+        let ds = &manifest.data_sources[0].as_onchain().unwrap();
+        // For more detailed tests of parsing CallDecls see the data_soure
+        // module in chain/ethereum
+        let decls = &ds.mapping.event_handlers[0].calls.decls;
+        assert_eq!(2, decls.len());
     });
 }

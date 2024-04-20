@@ -17,21 +17,24 @@ mod types;
 // Try to reexport most of the necessary types
 use crate::{
     cheap_clone::CheapClone,
-    components::store::{DeploymentCursorTracker, DeploymentLocator, StoredDynamicDataSource},
+    components::{
+        metrics::subgraph::SubgraphInstanceMetrics,
+        store::{DeploymentCursorTracker, DeploymentLocator, StoredDynamicDataSource},
+        subgraph::{HostMetrics, InstanceDSTemplateInfo, MappingError},
+        trigger_processor::RunnableTriggers,
+    },
     data::subgraph::{UnifiedMappingApiVersion, MIN_SPEC_VERSION},
-    data_source,
+    data_source::{self, DataSourceTemplateInfo},
     prelude::DataSourceContext,
     runtime::{gas::GasCounter, AscHeap, HostExportError},
 };
 use crate::{
-    components::{
-        store::{BlockNumber, ChainStore},
-        subgraph::DataSourceTemplateInfo,
-    },
+    components::store::{BlockNumber, ChainStore},
     prelude::{thiserror::Error, LinkResolver},
 };
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
+use graph_derive::CheapClone;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use slog::Logger;
@@ -48,7 +51,7 @@ pub use block_stream::{ChainHeadUpdateListener, ChainHeadUpdateStream, TriggersA
 pub use builder::{BasicBlockchainBuilder, BlockchainBuilder};
 pub use empty_node_capabilities::EmptyNodeCapabilities;
 pub use noop_runtime_adapter::NoopRuntimeAdapter;
-pub use types::{BlockHash, BlockPtr, ChainIdentifier};
+pub use types::{BlockHash, BlockPtr, BlockTime, ChainIdentifier};
 
 use self::{
     block_stream::{BlockStream, FirehoseCursor},
@@ -91,6 +94,8 @@ pub trait Block: Send + Sync {
     fn data(&self) -> Result<serde_json::Value, serde_json::Error> {
         Ok(serde_json::Value::Null)
     }
+
+    fn timestamp(&self) -> BlockTime;
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +170,11 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
 
     type NodeCapabilities: NodeCapabilities<Self> + std::fmt::Display;
 
+    /// A callback that is called after the triggers have been decoded and
+    /// gets an opportunity to post-process triggers before they are run on
+    /// hosts
+    type DecoderHook: DecoderHook<Self> + Sync + Send;
+
     fn triggers_adapter(
         &self,
         log: &DeploymentLocator,
@@ -197,7 +207,7 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
 
     fn is_refetch_block_required(&self) -> bool;
 
-    fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapter<Self>>;
+    fn runtime(&self) -> (Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook);
 
     fn chain_client(&self) -> Arc<ChainClient<Self>>;
 
@@ -246,7 +256,10 @@ pub trait TriggerFilter<C: Blockchain>: Default + Clone + Send + Sync {
 }
 
 pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
-    fn from_template_info(info: DataSourceTemplateInfo<C>) -> Result<Self, Error>;
+    fn from_template_info(
+        info: InstanceDSTemplateInfo,
+        template: &data_source::DataSourceTemplate<C>,
+    ) -> Result<Self, Error>;
 
     fn from_stored_dynamic_data_source(
         template: &C::DataSourceTemplate,
@@ -255,15 +268,18 @@ pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
 
     fn address(&self) -> Option<&[u8]>;
     fn start_block(&self) -> BlockNumber;
+    fn end_block(&self) -> Option<BlockNumber>;
     fn name(&self) -> &str;
     fn kind(&self) -> &str;
     fn network(&self) -> Option<&str>;
     fn context(&self) -> Arc<Option<DataSourceContext>>;
     fn creation_block(&self) -> Option<BlockNumber>;
     fn api_version(&self) -> semver::Version;
+
     fn min_spec_version(&self) -> semver::Version {
         MIN_SPEC_VERSION
     }
+
     fn runtime(&self) -> Option<Arc<Vec<u8>>>;
 
     fn handler_kinds(&self) -> HashSet<&str>;
@@ -291,7 +307,12 @@ pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
     fn as_stored_dynamic_data_source(&self) -> StoredDynamicDataSource;
 
     /// Used as part of manifest validation. If there are no errors, return an empty vector.
-    fn validate(&self) -> Vec<Error>;
+    fn validate(&self, spec_version: &semver::Version) -> Vec<Error>;
+
+    fn has_expired(&self, block: BlockNumber) -> bool {
+        self.end_block()
+            .map_or(false, |end_block| block > end_block)
+    }
 }
 
 #[async_trait]
@@ -312,6 +333,15 @@ pub trait DataSourceTemplate<C: Blockchain>: Send + Sync + Debug {
     fn name(&self) -> &str;
     fn manifest_idx(&self) -> u32;
     fn kind(&self) -> &str;
+    fn info(&self) -> DataSourceTemplateInfo {
+        DataSourceTemplateInfo {
+            api_version: self.api_version(),
+            runtime: self.runtime(),
+            name: self.name().to_string(),
+            manifest_idx: Some(self.manifest_idx()),
+            kind: self.kind().to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -346,28 +376,49 @@ pub trait MappingTriggerTrait {
     fn error_context(&self) -> String;
 }
 
+/// A callback that is called after the triggers have been decoded.
+#[async_trait]
+pub trait DecoderHook<C: Blockchain> {
+    async fn after_decode<'a>(
+        &self,
+        logger: &Logger,
+        block_ptr: &BlockPtr,
+        triggers: Vec<RunnableTriggers<'a, C>>,
+        metrics: &Arc<SubgraphInstanceMetrics>,
+    ) -> Result<Vec<RunnableTriggers<'a, C>>, MappingError>;
+}
+
+/// A decoder hook that does nothing and just returns the triggers that were
+/// passed in
+pub struct NoopDecoderHook;
+
+#[async_trait]
+impl<C: Blockchain> DecoderHook<C> for NoopDecoderHook {
+    async fn after_decode<'a>(
+        &self,
+        _: &Logger,
+        _: &BlockPtr,
+        triggers: Vec<RunnableTriggers<'a, C>>,
+        _: &Arc<SubgraphInstanceMetrics>,
+    ) -> Result<Vec<RunnableTriggers<'a, C>>, MappingError> {
+        Ok(triggers)
+    }
+}
+
 pub struct HostFnCtx<'a> {
     pub logger: Logger,
     pub block_ptr: BlockPtr,
     pub heap: &'a mut dyn AscHeap,
     pub gas: GasCounter,
+    pub metrics: Arc<HostMetrics>,
 }
 
 /// Host fn that receives one u32 argument and returns an u32.
 /// The name for an AS fuction is in the format `<namespace>.<function>`.
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 pub struct HostFn {
     pub name: &'static str,
     pub func: Arc<dyn Send + Sync + Fn(HostFnCtx, u32) -> Result<u32, HostExportError>>,
-}
-
-impl CheapClone for HostFn {
-    fn cheap_clone(&self) -> Self {
-        HostFn {
-            name: self.name,
-            func: self.func.cheap_clone(),
-        }
-    }
 }
 
 pub trait RuntimeAdapter<C: Blockchain>: Send + Sync {
@@ -395,6 +446,8 @@ pub enum BlockchainKind {
     Cosmos,
 
     Substreams,
+
+    Starknet,
 }
 
 impl fmt::Display for BlockchainKind {
@@ -405,6 +458,7 @@ impl fmt::Display for BlockchainKind {
             BlockchainKind::Near => "near",
             BlockchainKind::Cosmos => "cosmos",
             BlockchainKind::Substreams => "substreams",
+            BlockchainKind::Starknet => "starknet",
         };
         write!(f, "{}", value)
     }
@@ -420,6 +474,7 @@ impl FromStr for BlockchainKind {
             "near" => Ok(BlockchainKind::Near),
             "cosmos" => Ok(BlockchainKind::Cosmos),
             "substreams" => Ok(BlockchainKind::Substreams),
+            "starknet" => Ok(BlockchainKind::Starknet),
             _ => Err(anyhow!("unknown blockchain kind {}", s)),
         }
     }

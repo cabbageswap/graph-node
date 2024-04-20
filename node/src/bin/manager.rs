@@ -3,6 +3,7 @@ use config::PoolSize;
 use git_testament::{git_testament, render_testament};
 use graph::bail;
 use graph::endpoint::EndpointMetrics;
+use graph::env::ENV_VARS;
 use graph::log::logger_with_levels;
 use graph::prelude::{MetricsRegistry, BLOCK_NUMBER_MAX};
 use graph::{data::graphql::load_manager::LoadManager, prelude::chrono, prometheus::Registry};
@@ -32,7 +33,7 @@ use graph_store_postgres::{
 };
 use lazy_static::lazy_static;
 use std::collections::BTreeMap;
-use std::{collections::HashMap, env, num::ParseIntError, sync::Arc, time::Duration};
+use std::{collections::HashMap, num::ParseIntError, sync::Arc, time::Duration};
 const VERSION_LABEL_KEY: &str = "version";
 
 git_testament!(TESTAMENT);
@@ -310,9 +311,10 @@ pub enum Command {
         /// GRAPH_STORE_HISTORY_DELETE_THRESHOLD
         #[clap(long, short)]
         delete_threshold: Option<f64>,
-        /// How much history to keep in blocks
-        #[clap(long, short = 'y', default_value = "10000")]
-        history: usize,
+        /// How much history to keep in blocks. Defaults to
+        /// GRAPH_MIN_HISTORY_BLOCKS
+        #[clap(long, short = 'y')]
+        history: Option<usize>,
         /// Prune only this once
         #[clap(long, short)]
         once: bool,
@@ -344,6 +346,20 @@ pub enum Command {
         #[clap(long, short)]
         force: bool,
     },
+
+    // Deploy a subgraph
+    Deploy {
+        name: DeploymentSearch,
+        deployment: DeploymentSearch,
+
+        /// The url of the graph-node
+        #[clap(long, short, default_value = "http://localhost:8020")]
+        url: String,
+
+        /// Create the subgraph name if it does not exist
+        #[clap(long, short)]
+        create: bool,
+    },
 }
 
 impl Command {
@@ -360,8 +376,12 @@ pub enum UnusedCommand {
     /// List unused deployments
     List {
         /// Only list unused deployments that still exist
-        #[clap(short, long)]
+        #[clap(short, long, conflicts_with = "deployment")]
         existing: bool,
+
+        /// Deployment
+        #[clap(short, long)]
+        deployment: Option<DeploymentSearch>,
     },
     /// Update and record currently unused deployments
     Record,
@@ -527,6 +547,16 @@ pub enum ChainCommand {
         force: bool,
     },
 
+    /// Change the block cache shard for a chain
+    ChangeShard {
+        /// Chain name (must be an existing chain, see 'chain list')
+        #[clap(empty_values = false)]
+        chain_name: String,
+        /// Shard name
+        #[clap(empty_values = false)]
+        shard: String,
+    },
+
     /// Execute operations on call cache.
     CallCache {
         #[clap(subcommand)]
@@ -658,12 +688,12 @@ pub enum IndexCommand {
         /// case (as its SQL colmun name).
         #[clap(min_values = 1, required = true)]
         fields: Vec<String>,
-        /// The index method. Defaults to `btree`.
+        /// The index method. Defaults to `btree` in general, and to `gist` when the index includes the `block_range` column
         #[clap(
-            short, long, default_value = "btree",
+            short, long,
             possible_values = &["btree", "hash", "gist", "spgist", "gin", "brin"]
         )]
-        method: String,
+        method: Option<String>,
 
         #[clap(long)]
         /// Specifies a starting block number for creating a partial index.
@@ -1100,7 +1130,10 @@ async fn main() -> anyhow::Result<()> {
             use UnusedCommand::*;
 
             match cmd {
-                List { existing } => commands::unused_deployments::list(store, existing),
+                List {
+                    existing,
+                    deployment,
+                } => commands::unused_deployments::list(store, existing, deployment),
                 Record => commands::unused_deployments::record(store),
                 Remove {
                     count,
@@ -1272,6 +1305,15 @@ async fn main() -> anyhow::Result<()> {
                 Remove { name } => {
                     let (block_store, primary) = ctx.block_store_and_primary_pool();
                     commands::chain::remove(primary, block_store, name)
+                }
+                ChangeShard { chain_name, shard } => {
+                    let (block_store, primary) = ctx.block_store_and_primary_pool();
+                    commands::chain::change_block_cache_shard(
+                        primary,
+                        block_store,
+                        chain_name,
+                        shard,
+                    )
                 }
                 CheckBlocks { method, chain_name } => {
                     use commands::check_blocks::{by_hash, by_number, by_range};
@@ -1479,6 +1521,7 @@ async fn main() -> anyhow::Result<()> {
             once,
         } => {
             let (store, primary_pool) = ctx.store_and_primary();
+            let history = history.unwrap_or(ENV_VARS.min_history_blocks.try_into()?);
             commands::prune::run(
                 store,
                 primary_pool,
@@ -1512,6 +1555,18 @@ async fn main() -> anyhow::Result<()> {
                 force,
             )
             .await
+        }
+
+        Deploy {
+            deployment,
+            name,
+            url,
+            create,
+        } => {
+            let store = ctx.store();
+            let subgraph_store = store.subgraph_store();
+
+            commands::deploy::run(subgraph_store, deployment, name, url, create).await
         }
     }
 }

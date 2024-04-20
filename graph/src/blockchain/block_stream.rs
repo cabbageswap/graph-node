@@ -4,16 +4,20 @@ use crate::substreams_rpc::BlockScopedData;
 use anyhow::Error;
 use async_stream::stream;
 use futures03::Stream;
+use prost_types::Any;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use super::{Block, BlockPtr, Blockchain};
+use super::substreams_block_stream::SubstreamsLogData;
+use super::{Block, BlockPtr, BlockTime, Blockchain};
 use crate::anyhow::Result;
 use crate::components::store::{BlockNumber, DeploymentLocator};
 use crate::data::subgraph::UnifiedMappingApiVersion;
 use crate::firehose::{self, FirehoseEndpoint};
+use crate::futures03::stream::StreamExt as _;
 use crate::schema::InputSchema;
 use crate::substreams_rpc::response::Message;
 use crate::{prelude::*, prometheus::labels};
@@ -23,7 +27,7 @@ pub const FIREHOSE_BUFFER_STREAM_SIZE: usize = 1;
 pub const SUBSTREAMS_BUFFER_STREAM_SIZE: usize = 100;
 
 pub struct BufferedBlockStream<C: Blockchain> {
-    inner: Pin<Box<dyn Stream<Item = Result<BlockStreamEvent<C>, Error>> + Send>>,
+    inner: Pin<Box<dyn Stream<Item = Result<BlockStreamEvent<C>, BlockStreamError>> + Send>>,
 }
 
 impl<C: Blockchain + 'static> BufferedBlockStream<C> {
@@ -31,13 +35,14 @@ impl<C: Blockchain + 'static> BufferedBlockStream<C> {
         size_hint: usize,
         stream: Box<dyn BlockStream<C>>,
     ) -> Box<dyn BlockStream<C>> {
-        let (sender, receiver) = mpsc::channel::<Result<BlockStreamEvent<C>, Error>>(size_hint);
+        let (sender, receiver) =
+            mpsc::channel::<Result<BlockStreamEvent<C>, BlockStreamError>>(size_hint);
         crate::spawn(async move { BufferedBlockStream::stream_blocks(stream, sender).await });
 
         Box::new(BufferedBlockStream::new(receiver))
     }
 
-    pub fn new(mut receiver: Receiver<Result<BlockStreamEvent<C>, Error>>) -> Self {
+    pub fn new(mut receiver: Receiver<Result<BlockStreamEvent<C>, BlockStreamError>>) -> Self {
         let inner = stream! {
             loop {
                 let event = match receiver.recv().await {
@@ -56,7 +61,7 @@ impl<C: Blockchain + 'static> BufferedBlockStream<C> {
 
     pub async fn stream_blocks(
         mut stream: Box<dyn BlockStream<C>>,
-        sender: Sender<Result<BlockStreamEvent<C>, Error>>,
+        sender: Sender<Result<BlockStreamEvent<C>, BlockStreamError>>,
     ) -> Result<(), Error> {
         while let Some(event) = stream.next().await {
             match sender.send(event).await {
@@ -81,7 +86,7 @@ impl<C: Blockchain> BlockStream<C> for BufferedBlockStream<C> {
 }
 
 impl<C: Blockchain> Stream for BufferedBlockStream<C> {
-    type Item = Result<BlockStreamEvent<C>, Error>;
+    type Item = Result<BlockStreamEvent<C>, BlockStreamError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -92,7 +97,7 @@ impl<C: Blockchain> Stream for BufferedBlockStream<C> {
 }
 
 pub trait BlockStream<C: Blockchain>:
-    Stream<Item = Result<BlockStreamEvent<C>, Error>> + Unpin + Send
+    Stream<Item = Result<BlockStreamEvent<C>, BlockStreamError>> + Unpin + Send
 {
     fn buffer_size_hint(&self) -> usize;
 }
@@ -336,41 +341,49 @@ pub trait FirehoseMapper<C: Blockchain>: Send + Sync {
 }
 
 #[async_trait]
-pub trait SubstreamsMapper<C: Blockchain>: Send + Sync {
-    fn decode_block(&self, output: Option<&prost_types::Any>) -> Result<Option<C::Block>, Error>;
+pub trait BlockStreamMapper<C: Blockchain>: Send + Sync {
+    fn decode_block(&self, output: Option<&[u8]>) -> Result<Option<C::Block>, BlockStreamError>;
 
     async fn block_with_triggers(
         &self,
         logger: &Logger,
         block: C::Block,
-    ) -> Result<BlockWithTriggers<C>, Error>;
+    ) -> Result<BlockWithTriggers<C>, BlockStreamError>;
 
-    async fn decode_triggers(
+    async fn handle_substreams_block(
         &self,
         logger: &Logger,
-        clock: &Clock,
-        block: &prost_types::Any,
-    ) -> Result<BlockWithTriggers<C>, Error>;
+        clock: Clock,
+        cursor: FirehoseCursor,
+        block: Vec<u8>,
+    ) -> Result<BlockStreamEvent<C>, BlockStreamError>;
 
     async fn to_block_stream_event(
         &self,
         logger: &mut Logger,
         message: Option<Message>,
-    ) -> Result<Option<BlockStreamEvent<C>>, SubstreamsError> {
+        log_data: &mut SubstreamsLogData,
+    ) -> Result<Option<BlockStreamEvent<C>>, BlockStreamError> {
         match message {
             Some(SubstreamsMessage::Session(session_init)) => {
-                *logger = logger.new(o!("trace_id" => session_init.trace_id));
+                info!(
+                    &logger,
+                    "Received session init";
+                    "session" => format!("{:?}", session_init),
+                );
+                log_data.trace_id = session_init.trace_id;
                 return Ok(None);
             }
             Some(SubstreamsMessage::BlockUndoSignal(undo)) => {
                 let valid_block = match undo.last_valid_block {
                     Some(clock) => clock,
-                    None => return Err(SubstreamsError::InvalidUndoError),
+                    None => return Err(BlockStreamError::from(SubstreamsError::InvalidUndoError)),
                 };
                 let valid_ptr = BlockPtr {
                     hash: valid_block.id.trim_start_matches("0x").try_into()?,
                     number: valid_block.number as i32,
                 };
+                log_data.last_seen_block = valid_block.number;
                 return Ok(Some(BlockStreamEvent::Revert(
                     valid_ptr,
                     FirehoseCursor::from(undo.last_valid_cursor.clone()),
@@ -394,20 +407,37 @@ pub trait SubstreamsMapper<C: Blockchain>: Send + Sync {
 
                 let clock = match clock {
                     Some(clock) => clock,
-                    None => return Err(SubstreamsError::MissingClockError),
+                    None => return Err(BlockStreamError::from(SubstreamsError::MissingClockError)),
                 };
 
-                let map_output = match module_output.map_output {
-                    Some(mo) => mo,
+                let value = match module_output.map_output {
+                    Some(Any { type_url: _, value }) => value,
                     None => return Ok(None),
                 };
 
-                let block = self.decode_triggers(&logger, &clock, &map_output).await?;
+                log_data.last_seen_block = clock.number;
+                let cursor = FirehoseCursor::from(cursor);
 
-                Ok(Some(BlockStreamEvent::ProcessBlock(
-                    block,
-                    FirehoseCursor::from(cursor.clone()),
-                )))
+                let event = self
+                    .handle_substreams_block(&logger, clock, cursor, value)
+                    .await?;
+
+                Ok(Some(event))
+            }
+
+            Some(SubstreamsMessage::Progress(progress)) => {
+                if log_data.last_progress.elapsed() > Duration::from_secs(30) {
+                    info!(&logger, "{}", log_data.info_string(&progress); "trace_id" => &log_data.trace_id);
+                    debug!(&logger, "{}", log_data.debug_string(&progress); "trace_id" => &log_data.trace_id);
+                    trace!(
+                        &logger,
+                        "Received progress update";
+                        "progress" => format!("{:?}", progress),
+                        "trace_id" => &log_data.trace_id,
+                    );
+                    log_data.last_progress = Instant::now();
+                }
+                Ok(None)
             }
 
             // ignoring Progress messages and SessionInit
@@ -428,6 +458,15 @@ pub enum FirehoseError {
     UnknownError(#[from] anyhow::Error),
 }
 
+impl From<BlockStreamError> for FirehoseError {
+    fn from(value: BlockStreamError) -> Self {
+        match value {
+            BlockStreamError::ProtobufDecodingError(e) => FirehoseError::DecodingError(e),
+            e => FirehoseError::UnknownError(anyhow!(e.to_string())),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum SubstreamsError {
     #[error("response is missing the clock information")]
@@ -436,12 +475,15 @@ pub enum SubstreamsError {
     #[error("invalid undo message")]
     InvalidUndoError,
 
+    #[error("entity validation failed {0}")]
+    EntityValidationError(#[from] crate::data::store::EntityValidationError),
+
     /// We were unable to decode the received block payload into the chain specific Block struct (e.g. chain_ethereum::pb::Block)
     #[error("received gRPC block payload cannot be decoded: {0}")]
     DecodingError(#[from] prost::DecodeError),
 
     /// Some unknown error occurred
-    #[error("unknown error")]
+    #[error("unknown error {0}")]
     UnknownError(#[from] anyhow::Error),
 
     #[error("multiple module output error")]
@@ -454,12 +496,48 @@ pub enum SubstreamsError {
     UnexpectedStoreDeltaOutput,
 }
 
+impl SubstreamsError {
+    pub fn is_deterministic(&self) -> bool {
+        use SubstreamsError::*;
+
+        match self {
+            EntityValidationError(_) => true,
+            MissingClockError
+            | InvalidUndoError
+            | DecodingError(_)
+            | UnknownError(_)
+            | MultipleModuleOutputError
+            | ModuleOutputNotPresentOrUnexpected
+            | UnexpectedStoreDeltaOutput => false,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum BlockStreamError {
+    #[error("Failed to decode protobuf {0}")]
+    ProtobufDecodingError(#[from] prost::DecodeError),
+    #[error("substreams error: {0}")]
+    SubstreamsError(#[from] SubstreamsError),
+    #[error("block stream error {0}")]
+    Unknown(#[from] anyhow::Error),
+    #[error("block stream fatal error {0}")]
+    Fatal(String),
+}
+
+impl BlockStreamError {
+    pub fn is_deterministic(&self) -> bool {
+        matches!(self, Self::Fatal(_))
+    }
+}
+
 #[derive(Debug)]
 pub enum BlockStreamEvent<C: Blockchain> {
     // The payload is the block the subgraph should revert to, so it becomes the new subgraph head.
     Revert(BlockPtr, FirehoseCursor),
 
     ProcessBlock(BlockWithTriggers<C>, FirehoseCursor),
+    ProcessWasmBlock(BlockPtr, BlockTime, Box<[u8]>, String, FirehoseCursor),
 }
 
 impl<C: Blockchain> Clone for BlockStreamEvent<C>
@@ -470,6 +548,13 @@ where
         match self {
             Self::Revert(arg0, arg1) => Self::Revert(arg0.clone(), arg1.clone()),
             Self::ProcessBlock(arg0, arg1) => Self::ProcessBlock(arg0.clone(), arg1.clone()),
+            Self::ProcessWasmBlock(arg0, arg1, arg2, arg3, arg4) => Self::ProcessWasmBlock(
+                arg0.clone(),
+                arg1.clone(),
+                arg2.clone(),
+                arg3.clone(),
+                arg4.clone(),
+            ),
         }
     }
 }
@@ -540,7 +625,6 @@ pub trait ChainHeadUpdateListener: Send + Sync + 'static {
 mod test {
     use std::{collections::HashSet, task::Poll};
 
-    use anyhow::Error;
     use futures03::{Stream, StreamExt, TryStreamExt};
 
     use crate::{
@@ -549,7 +633,8 @@ mod test {
     };
 
     use super::{
-        BlockStream, BlockStreamEvent, BlockWithTriggers, BufferedBlockStream, FirehoseCursor,
+        BlockStream, BlockStreamError, BlockStreamEvent, BlockWithTriggers, BufferedBlockStream,
+        FirehoseCursor,
     };
 
     #[derive(Debug)]
@@ -564,7 +649,7 @@ mod test {
     }
 
     impl Stream for TestStream {
-        type Item = Result<BlockStreamEvent<MockBlockchain>, Error>;
+        type Item = Result<BlockStreamEvent<MockBlockchain>, BlockStreamError>;
 
         fn poll_next(
             mut self: std::pin::Pin<&mut Self>,

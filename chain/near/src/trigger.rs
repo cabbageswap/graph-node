@@ -1,7 +1,7 @@
 use graph::blockchain::Block;
 use graph::blockchain::MappingTriggerTrait;
 use graph::blockchain::TriggerData;
-use graph::cheap_clone::CheapClone;
+use graph::derive::CheapClone;
 use graph::prelude::hex;
 use graph::prelude::web3::types::H256;
 use graph::prelude::BlockNumber;
@@ -50,19 +50,10 @@ impl ToAscPtr for NearTrigger {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 pub enum NearTrigger {
     Block(Arc<codec::Block>),
     Receipt(Arc<ReceiptWithOutcome>),
-}
-
-impl CheapClone for NearTrigger {
-    fn cheap_clone(&self) -> NearTrigger {
-        match self {
-            NearTrigger::Block(block) => NearTrigger::Block(block.cheap_clone()),
-            NearTrigger::Receipt(receipt) => NearTrigger::Receipt(receipt.cheap_clone()),
-        }
-    }
 }
 
 impl PartialEq for NearTrigger {
@@ -164,6 +155,7 @@ mod tests {
 
     use graph::{
         anyhow::anyhow,
+        components::metrics::gas::GasMetrics,
         data::subgraph::API_VERSION_0_0_5,
         prelude::{hex, BigInt},
         runtime::{gas::GasCounter, DeterministicHostError, HostExportError},
@@ -175,7 +167,7 @@ mod tests {
         let mut heap = BytesHeap::new(API_VERSION_0_0_5);
         let trigger = NearTrigger::Block(Arc::new(block()));
 
-        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::default());
+        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::new(GasMetrics::mock()));
         assert!(result.is_ok());
     }
 
@@ -188,7 +180,7 @@ mod tests {
             receipt: receipt().unwrap(),
         }));
 
-        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::default());
+        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::new(GasMetrics::mock()));
         assert!(result.is_ok());
     }
 

@@ -3,7 +3,9 @@ mod costs;
 mod ops;
 mod saturating;
 mod size_of;
-use crate::prelude::{CheapClone, ENV_VARS};
+use crate::components::metrics::gas::GasMetrics;
+use crate::derive::CheapClone;
+use crate::prelude::ENV_VARS;
 use crate::runtime::DeterministicHostError;
 pub use combinators::*;
 pub use costs::DEFAULT_BASE_COST;
@@ -54,7 +56,7 @@ pub trait GasSizeOf {
 
 /// This wrapper ensures saturating arithmetic is used
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct Gas(u64);
+pub struct Gas(pub u64);
 
 impl Gas {
     pub const ZERO: Gas = Gas(0);
@@ -75,22 +77,38 @@ impl Display for Gas {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct GasCounter(Arc<AtomicU64>);
-
-impl CheapClone for GasCounter {}
+#[derive(Clone, CheapClone)]
+pub struct GasCounter {
+    counter: Arc<AtomicU64>,
+    metrics: GasMetrics,
+}
 
 impl GasCounter {
-    /// Alias of [`Default::default`].
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(metrics: GasMetrics) -> Self {
+        Self {
+            counter: Arc::new(AtomicU64::new(0)),
+            metrics,
+        }
     }
 
     /// This should be called once per host export
-    pub fn consume_host_fn(&self, mut amount: Gas) -> Result<(), DeterministicHostError> {
+    pub fn consume_host_fn_inner(
+        &self,
+        mut amount: Gas,
+        method: Option<&str>,
+    ) -> Result<(), DeterministicHostError> {
         amount += costs::HOST_EXPORT_GAS;
+
+        // If gas metrics are enabled, track the gas used
+        if ENV_VARS.enable_dips_metrics {
+            if let Some(method) = method {
+                self.metrics.track_gas(method, amount.0);
+                self.metrics.track_operations(method, 1);
+            }
+        }
+
         let old = self
-            .0
+            .counter
             .fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_add(amount.0)))
             .unwrap();
         let new = old.saturating_add(amount.0);
@@ -104,7 +122,19 @@ impl GasCounter {
         }
     }
 
+    pub fn consume_host_fn(&self, amount: Gas) -> Result<(), DeterministicHostError> {
+        self.consume_host_fn_inner(amount, Some("untracked"))
+    }
+
+    pub fn consume_host_fn_with_metrics(
+        &self,
+        amount: Gas,
+        method: &str,
+    ) -> Result<(), DeterministicHostError> {
+        self.consume_host_fn_inner(amount, Some(method))
+    }
+
     pub fn get(&self) -> Gas {
-        Gas(self.0.load(SeqCst))
+        Gas(self.counter.load(SeqCst))
     }
 }

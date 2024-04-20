@@ -3,18 +3,92 @@ use std::str::FromStr;
 
 use crate::codec::{entity_change, EntityChanges};
 use anyhow::{anyhow, Error};
-use graph::blockchain::block_stream::{BlockWithTriggers, SubstreamsError, SubstreamsMapper};
+use graph::blockchain::block_stream::{
+    BlockStreamError, BlockStreamEvent, BlockStreamMapper, BlockWithTriggers, FirehoseCursor,
+    SubstreamsError,
+};
+use graph::blockchain::BlockTime;
 use graph::data::store::scalar::Bytes;
 use graph::data::store::IdType;
 use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
-use graph::prelude::BigDecimal;
 use graph::prelude::{async_trait, BigInt, BlockHash, BlockNumber, Logger, Value};
+use graph::prelude::{BigDecimal, BlockPtr};
 use graph::schema::InputSchema;
+use graph::slog::error;
 use graph::substreams::Clock;
 use prost::Message;
 
 use crate::{Block, Chain, ParsedChanges, TriggerData};
+
+// WasmBlockMapper will not perform any transformation to the block and cannot make assumptions
+// about the block format. This mode just works a passthrough from the block stream to the subgraph
+// mapping which will do the decoding and store actions.
+pub struct WasmBlockMapper {
+    pub handler: String,
+}
+
+#[async_trait]
+impl BlockStreamMapper<Chain> for WasmBlockMapper {
+    fn decode_block(
+        &self,
+        _output: Option<&[u8]>,
+    ) -> Result<Option<crate::Block>, BlockStreamError> {
+        unreachable!("WasmBlockMapper does not do block decoding")
+    }
+
+    async fn block_with_triggers(
+        &self,
+        _logger: &Logger,
+        _block: crate::Block,
+    ) -> Result<BlockWithTriggers<Chain>, BlockStreamError> {
+        unreachable!("WasmBlockMapper does not do trigger decoding")
+    }
+
+    async fn handle_substreams_block(
+        &self,
+        logger: &Logger,
+        clock: Clock,
+        cursor: FirehoseCursor,
+        block: Vec<u8>,
+    ) -> Result<BlockStreamEvent<Chain>, BlockStreamError> {
+        let Clock {
+            id,
+            number,
+            timestamp,
+        } = clock;
+
+        let block_ptr = BlockPtr {
+            hash: BlockHash::from(id.into_bytes()),
+            number: BlockNumber::from(TryInto::<i32>::try_into(number).map_err(Error::from)?),
+        };
+
+        let block_data = block.into_boxed_slice();
+
+        // `timestamp` is an `Option`, but it should always be set
+        let timestamp = match timestamp {
+            None => {
+                error!(logger,
+                    "Substream block is missing a timestamp";
+                    "cursor" => cursor.to_string(),
+                    "number" => number,
+                );
+                return Err(anyhow!(
+                    "Substream block is missing a timestamp at cursor {cursor}, block number {number}"
+                )).map_err(BlockStreamError::from);
+            }
+            Some(ts) => BlockTime::since_epoch(ts.seconds, ts.nanos as u32),
+        };
+
+        Ok(BlockStreamEvent::ProcessWasmBlock(
+            block_ptr,
+            timestamp,
+            block_data,
+            self.handler.clone(),
+            cursor,
+        ))
+    }
+}
 
 // Mapper will transform the proto content coming from substreams in the graph-out format
 // into the internal Block representation. If schema is passed then additional transformation
@@ -29,12 +103,10 @@ pub struct Mapper {
 }
 
 #[async_trait]
-impl SubstreamsMapper<Chain> for Mapper {
-    fn decode_block(&self, output: Option<&prost_types::Any>) -> Result<Option<Block>, Error> {
+impl BlockStreamMapper<Chain> for Mapper {
+    fn decode_block(&self, output: Option<&[u8]>) -> Result<Option<Block>, BlockStreamError> {
         let changes: EntityChanges = match output {
-            Some(msg) => {
-                Message::decode(msg.value.as_slice()).map_err(SubstreamsError::DecodingError)?
-            }
+            Some(msg) => Message::decode(msg).map_err(SubstreamsError::DecodingError)?,
             None => EntityChanges {
                 entity_changes: [].to_vec(),
             },
@@ -62,7 +134,7 @@ impl SubstreamsMapper<Chain> for Mapper {
         &self,
         logger: &Logger,
         block: Block,
-    ) -> Result<BlockWithTriggers<Chain>, Error> {
+    ) -> Result<BlockWithTriggers<Chain>, BlockStreamError> {
         let mut triggers = vec![];
         if block.changes.entity_changes.len() >= 1 {
             triggers.push(TriggerData {});
@@ -71,32 +143,36 @@ impl SubstreamsMapper<Chain> for Mapper {
         Ok(BlockWithTriggers::new(block, triggers, logger))
     }
 
-    async fn decode_triggers(
+    async fn handle_substreams_block(
         &self,
         logger: &Logger,
-        clock: &Clock,
-        block: &prost_types::Any,
-    ) -> Result<BlockWithTriggers<Chain>, Error> {
-        let block_number: BlockNumber = clock.number.try_into()?;
-        let block_hash = clock.id.as_bytes().to_vec().try_into()?;
+        clock: Clock,
+        cursor: FirehoseCursor,
+        block: Vec<u8>,
+    ) -> Result<BlockStreamEvent<Chain>, BlockStreamError> {
+        let block_number: BlockNumber = clock.number.try_into().map_err(Error::from)?;
+        let block_hash = clock.id.as_bytes().to_vec().into();
 
         let block = self
-            .decode_block(Some(block))?
+            .decode_block(Some(&block))?
             .ok_or_else(|| anyhow!("expected block to not be empty"))?;
-        self.block_with_triggers(logger, block).await.map(|bt| {
+
+        let block = self.block_with_triggers(logger, block).await.map(|bt| {
             let mut block = bt;
 
             block.block.number = block_number;
             block.block.hash = block_hash;
             block
-        })
+        })?;
+
+        Ok(BlockStreamEvent::ProcessBlock(block, cursor))
     }
 }
 
 fn parse_changes(
     changes: &EntityChanges,
     schema: &InputSchema,
-) -> anyhow::Result<Vec<ParsedChanges>> {
+) -> Result<Vec<ParsedChanges>, SubstreamsError> {
     let mut parsed_changes = vec![];
     for entity_change in changes.entity_changes.iter() {
         let mut parsed_data: HashMap<Word, Value> = HashMap::default();
@@ -113,7 +189,7 @@ fn parse_changes(
         // real fix is what's described in [this
         // issue](https://github.com/graphprotocol/graph-node/issues/4663)
         let entity_id: String = match entity_type.id_type()? {
-            IdType::String => entity_change.id.clone(),
+            IdType::String | IdType::Int8 => entity_change.id.clone(),
             IdType::Bytes => {
                 if entity_change.id.starts_with("0x") {
                     entity_change.id.clone()
@@ -143,9 +219,7 @@ fn parse_changes(
                         .entry(Word::from(field.name.as_str()))
                         .or_insert(Value::Null) = value;
                 }
-                let entity = schema
-                    .make_entity(parsed_data)
-                    .map_err(anyhow::Error::from)?;
+                let entity = schema.make_entity(parsed_data)?;
 
                 ParsedChanges::Upsert { key, entity }
             }

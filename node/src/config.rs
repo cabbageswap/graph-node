@@ -1,6 +1,7 @@
 use graph::{
     anyhow::Error,
     blockchain::BlockchainKind,
+    env::ENV_VARS,
     firehose::{SubgraphLimit, SUBGRAPHS_PER_CONN},
     itertools::Itertools,
     prelude::{
@@ -17,12 +18,12 @@ use graph::{
 use graph_chain_ethereum::{self as ethereum, NodeCapabilities};
 use graph_store_postgres::{DeploymentPlacer, Shard as ShardName, PRIMARY_SHARD};
 
-use http::{HeaderMap, Uri};
-use std::fs::read_to_string;
+use graph::http::{HeaderMap, Uri};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+use std::{fs::read_to_string, time::Duration};
 use url::Url;
 
 const ANY_NAME: &str = ".*";
@@ -495,6 +496,7 @@ impl ChainSection {
                 let entry = chains.entry(name.to_string()).or_insert_with(|| Chain {
                     shard: PRIMARY_SHARD.to_string(),
                     protocol: BlockchainKind::Ethereum,
+                    polling_interval: default_polling_interval(),
                     providers: vec![],
                 });
                 entry.providers.push(provider);
@@ -509,6 +511,11 @@ pub struct Chain {
     pub shard: String,
     #[serde(default = "default_blockchain_kind")]
     pub protocol: BlockchainKind,
+    #[serde(
+        default = "default_polling_interval",
+        deserialize_with = "deserialize_duration_millis"
+    )]
+    pub polling_interval: Duration,
     #[serde(rename = "provider")]
     pub providers: Vec<Provider>,
 }
@@ -571,9 +578,9 @@ fn btree_map_to_http_headers(kvs: BTreeMap<String, String>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (k, v) in kvs.into_iter() {
         headers.insert(
-            k.parse::<http::header::HeaderName>()
+            k.parse::<graph::http::header::HeaderName>()
                 .unwrap_or_else(|_| panic!("invalid HTTP header name: {}", k)),
-            v.parse::<http::header::HeaderValue>()
+            v.parse::<graph::http::header::HeaderValue>()
                 .unwrap_or_else(|_| panic!("invalid HTTP header value: {}: {}", k, v)),
         );
     }
@@ -608,6 +615,7 @@ fn twenty() -> u16 {
 pub struct FirehoseProvider {
     pub url: String,
     pub token: Option<String>,
+    pub key: Option<String>,
     #[serde(default = "twenty")]
     pub conn_pool_size: u16,
     #[serde(default)]
@@ -727,6 +735,9 @@ impl Provider {
 
                 if let Some(token) = &firehose.token {
                     firehose.token = Some(shellexpand::env(token)?.into_owned());
+                }
+                if let Some(key) = &firehose.key {
+                    firehose.key = Some(shellexpand::env(key)?.into_owned());
                 }
 
                 if firehose
@@ -1144,6 +1155,18 @@ fn default_node_id() -> NodeId {
     NodeId::new("default").unwrap()
 }
 
+fn default_polling_interval() -> Duration {
+    ENV_VARS.ingestor_polling_interval
+}
+
+fn deserialize_duration_millis<'de, D>(data: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let millis = u64::deserialize(data)?;
+    Ok(Duration::from_millis(millis))
+}
+
 // From https://github.com/serde-rs/serde/issues/889#issuecomment-295988865
 fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
@@ -1179,16 +1202,16 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::config::{ChainSection, Web3Rule};
+    use crate::config::{default_polling_interval, ChainSection, Web3Rule};
 
     use super::{
         Chain, Config, FirehoseProvider, Provider, ProviderDetails, Transport, Web3Provider,
     };
     use graph::blockchain::BlockchainKind;
     use graph::firehose::SubgraphLimit;
+    use graph::http::{HeaderMap, HeaderValue};
     use graph::prelude::regex::Regex;
     use graph::prelude::{toml, NodeId};
-    use http::{HeaderMap, HeaderValue};
     use std::collections::BTreeSet;
     use std::fs::read_to_string;
     use std::path::{Path, PathBuf};
@@ -1223,6 +1246,7 @@ mod tests {
             Chain {
                 shard: "primary".to_string(),
                 protocol: BlockchainKind::Ethereum,
+                polling_interval: default_polling_interval(),
                 providers: vec![],
             },
             actual
@@ -1244,6 +1268,7 @@ mod tests {
             Chain {
                 shard: "primary".to_string(),
                 protocol: BlockchainKind::Near,
+                polling_interval: default_polling_interval(),
                 providers: vec![],
             },
             actual
@@ -1466,6 +1491,7 @@ mod tests {
                 details: ProviderDetails::Firehose(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    key: None,
                     features: BTreeSet::new(),
                     conn_pool_size: 20,
                     rules: vec![],
@@ -1491,6 +1517,7 @@ mod tests {
                 details: ProviderDetails::Substreams(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    key: None,
                     features: BTreeSet::new(),
                     conn_pool_size: 20,
                     rules: vec![],
@@ -1499,6 +1526,33 @@ mod tests {
             actual
         );
     }
+
+    #[test]
+    fn it_works_on_substreams_provider_from_toml_with_api_key() {
+        let actual = toml::from_str(
+            r#"
+                label = "authed"
+                details = { type = "substreams", url = "http://localhost:9000", key = "KEY", features = [] }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Provider {
+                label: "authed".to_owned(),
+                details: ProviderDetails::Substreams(FirehoseProvider {
+                    url: "http://localhost:9000".to_owned(),
+                    token: None,
+                    key: Some("KEY".to_owned()),
+                    features: BTreeSet::new(),
+                    conn_pool_size: 20,
+                    rules: vec![],
+                }),
+            },
+            actual
+        );
+    }
+
     #[test]
     fn it_works_on_new_firehose_provider_from_toml_no_features() {
         let mut actual = toml::from_str(
@@ -1515,6 +1569,7 @@ mod tests {
                 details: ProviderDetails::Firehose(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    key: None,
                     features: BTreeSet::new(),
                     conn_pool_size: 20,
                     rules: vec![],
@@ -1544,6 +1599,7 @@ mod tests {
                 details: ProviderDetails::Firehose(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    key: None,
                     features: BTreeSet::new(),
                     conn_pool_size: 20,
                     rules: vec![
@@ -1582,6 +1638,7 @@ mod tests {
                 details: ProviderDetails::Substreams(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    key: None,
                     features: BTreeSet::new(),
                     conn_pool_size: 20,
                     rules: vec![
@@ -1620,6 +1677,7 @@ mod tests {
                 details: ProviderDetails::Substreams(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    key: None,
                     features: BTreeSet::new(),
                     conn_pool_size: 20,
                     rules: vec![
@@ -1658,6 +1716,7 @@ mod tests {
                 details: ProviderDetails::Substreams(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    key: None,
                     features: BTreeSet::new(),
                     conn_pool_size: 20,
                     rules: vec![
@@ -1825,5 +1884,46 @@ mod tests {
 
         let result = actual.validate();
         assert_eq!(true, result.is_ok(), "error: {:?}", result.unwrap_err());
+    }
+
+    #[test]
+    fn polling_interval() {
+        let default = default_polling_interval();
+        let different = 2 * default;
+
+        // Polling interval not set explicitly, use default
+        let actual = toml::from_str::<ChainSection>(
+            r#"
+            ingestor = "block_ingestor_node"
+            [mainnet]
+            shard = "vip"
+            provider = []"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            default,
+            actual.chains.get("mainnet").unwrap().polling_interval
+        );
+
+        // Polling interval set explicitly, use that
+        let actual = toml::from_str::<ChainSection>(
+            format!(
+                r#"
+            ingestor = "block_ingestor_node"
+            [mainnet]
+            shard = "vip"
+            provider = []
+            polling_interval = {}"#,
+                different.as_millis()
+            )
+            .as_str(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            different,
+            actual.chains.get("mainnet").unwrap().polling_interval
+        );
     }
 }

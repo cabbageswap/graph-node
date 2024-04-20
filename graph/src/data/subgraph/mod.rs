@@ -10,12 +10,15 @@ pub mod status;
 
 pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
 
-use crate::object;
+use crate::{cheap_clone::CheapClone, components::store::BLOCK_NUMBER_MAX, object};
 use anyhow::{anyhow, Context, Error};
 use futures03::{future::try_join, stream::FuturesOrdered, TryStreamExt as _};
 use itertools::Itertools;
 use semver::Version;
-use serde::{de, ser};
+use serde::{
+    de::{self, Visitor},
+    ser,
+};
 use serde_yaml;
 use slog::Logger;
 use stable_hash::{FieldAddress, StableHash};
@@ -43,8 +46,9 @@ use crate::{
         offchain::OFFCHAIN_KINDS, DataSource, DataSourceTemplate, UnresolvedDataSource,
         UnresolvedDataSourceTemplate,
     },
+    derive::CacheWeight,
     ensure,
-    prelude::{r, CheapClone, Value, ENV_VARS},
+    prelude::{r, Value, ENV_VARS},
     schema::{InputSchema, SchemaValidationError},
 };
 
@@ -73,8 +77,14 @@ where
 
 /// The IPFS hash used to identifiy a deployment externally, i.e., the
 /// `Qm..` string that `graph-cli` prints when deploying to a subgraph
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, CacheWeight, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct DeploymentHash(String);
+
+impl CheapClone for DeploymentHash {
+    fn cheap_clone(&self) -> Self {
+        self.clone()
+    }
+}
 
 impl stable_hash_legacy::StableHash for DeploymentHash {
     #[inline]
@@ -96,9 +106,6 @@ impl StableHash for DeploymentHash {
 }
 
 impl_slog_value!(DeploymentHash);
-
-/// `DeploymentHash` is fixed-length so cheap to clone.
-impl CheapClone for DeploymentHash {}
 
 impl DeploymentHash {
     /// Check that `s` is a valid `SubgraphDeploymentId` and create a new one.
@@ -406,6 +413,7 @@ pub struct UnresolvedSchema {
 impl UnresolvedSchema {
     pub async fn resolve(
         self,
+        spec_version: &Version,
         id: DeploymentHash,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
@@ -414,11 +422,12 @@ impl UnresolvedSchema {
             .cat(logger, &self.file)
             .await
             .with_context(|| format!("failed to resolve schema {}", &self.file.link))?;
-        InputSchema::parse(&String::from_utf8(schema_bytes)?, id)
+        InputSchema::parse(spec_version, &String::from_utf8(schema_bytes)?, id)
     }
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Source {
     /// The contract address for the data source. We allow data sources
     /// without an address for 'wildcard' triggers that catch all possible
@@ -426,8 +435,9 @@ pub struct Source {
     #[serde(default, deserialize_with = "deserialize_address")]
     pub address: Option<Address>,
     pub abi: String,
-    #[serde(rename = "startBlock", default)]
+    #[serde(default)]
     pub start_block: BlockNumber,
+    pub end_block: Option<BlockNumber>,
 }
 
 pub fn calls_host_fn(runtime: &[u8], host_fn: &str) -> anyhow::Result<bool> {
@@ -437,7 +447,7 @@ pub fn calls_host_fn(runtime: &[u8], host_fn: &str) -> anyhow::Result<bool> {
         if let Payload::ImportSection(s) = payload? {
             for import in s {
                 let import = import?;
-                if import.field == Some(host_fn) {
+                if import.name == host_fn {
                     return Ok(true);
                 }
             }
@@ -484,6 +494,19 @@ impl Graft {
             (Some(ptr), true) if ptr.number < self.block => Err(GraftBaseInvalid(format!(
                 "failed to graft onto `{}` at block {} since it has only processed block {}",
                 self.base, self.block, ptr.number
+            ))),
+            // The graft point must be at least `reorg_threshold` blocks
+            // behind the subgraph head so that a reorg can not affect the
+            // data that we copy for grafting
+            //
+            // This is pretty nasty: we have tests in the subgraph runner
+            // tests that graft onto the subgraph head directly. We
+            // therefore skip this check in debug builds and only turn it on
+            // in release builds
+            #[cfg(not(debug_assertions))]
+            (Some(ptr), true) if self.block + ENV_VARS.reorg_threshold >= ptr.number => Err(GraftBaseInvalid(format!(
+                "failed to graft onto `{}` at block {} since it's only at block {} which is within the reorg threshold of {} blocks",
+                self.base, self.block, ptr.number, ENV_VARS.reorg_threshold
             ))),
             // If the base deployment is failed *and* the `graft.block` is not
             // less than the `base.block`, the graft shouldn't be permitted.
@@ -540,6 +563,89 @@ pub struct BaseSubgraphManifest<C, S, D, T> {
     pub templates: Vec<T>,
     #[serde(skip_serializing, default)]
     pub chain: PhantomData<C>,
+    pub indexer_hints: Option<IndexerHints>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexerHints {
+    prune: Option<Prune>,
+}
+
+impl IndexerHints {
+    pub fn history_blocks(&self) -> BlockNumber {
+        match self.prune {
+            Some(ref hb) => hb.history_blocks(),
+            None => BLOCK_NUMBER_MAX,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Prune {
+    Auto,
+    Never,
+    Blocks(BlockNumber),
+}
+
+impl Prune {
+    pub fn history_blocks(&self) -> BlockNumber {
+        match self {
+            Prune::Never => BLOCK_NUMBER_MAX,
+            Prune::Auto => ENV_VARS.min_history_blocks,
+            Prune::Blocks(x) => *x,
+        }
+    }
+}
+
+impl<'de> de::Deserialize<'de> for Prune {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct HistoryBlocksVisitor;
+
+        const ERROR_MSG: &str = "expected 'all', 'min', or a number for history blocks";
+
+        impl<'de> Visitor<'de> for HistoryBlocksVisitor {
+            type Value = Prune;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string or an integer for history blocks")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Prune, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "never" => Ok(Prune::Never),
+                    "auto" => Ok(Prune::Auto),
+                    _ => value
+                        .parse::<i32>()
+                        .map(Prune::Blocks)
+                        .map_err(|_| E::custom(ERROR_MSG)),
+                }
+            }
+
+            fn visit_i32<E>(self, value: i32) -> Result<Prune, E>
+            where
+                E: de::Error,
+            {
+                Ok(Prune::Blocks(value))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let i = v.try_into().map_err(|_| E::custom(ERROR_MSG))?;
+                Ok(Prune::Blocks(i))
+            }
+        }
+
+        deserializer.deserialize_any(HistoryBlocksVisitor)
+    }
 }
 
 /// SubgraphManifest with IPFS links unresolved
@@ -589,7 +695,7 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
         }
 
         for ds in &self.0.data_sources {
-            errors.extend(ds.validate().into_iter().map(|e| {
+            errors.extend(ds.validate(&self.0.spec_version).into_iter().map(|e| {
                 SubgraphManifestValidationError::DataSourceValidation(ds.name().to_owned(), e)
             }));
         }
@@ -612,17 +718,6 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             1 => (),
             _ => errors.push(SubgraphManifestValidationError::MultipleEthereumNetworks),
         }
-
-        self.0
-            .schema
-            .validate()
-            .err()
-            .into_iter()
-            .for_each(|schema_errors| {
-                errors.push(SubgraphManifestValidationError::SchemaValidationError(
-                    schema_errors,
-                ));
-            });
 
         if let Some(graft) = &self.0.graft {
             if validate_graft_base {
@@ -681,6 +776,13 @@ impl<C: Blockchain> SubgraphManifest<C> {
             .iter()
             .filter_map(|d| Some(d.as_onchain()?.start_block()))
             .collect()
+    }
+
+    pub fn history_blocks(&self) -> BlockNumber {
+        match self.indexer_hints {
+            Some(ref hints) => hints.history_blocks(),
+            None => BLOCK_NUMBER_MAX,
+        }
     }
 
     pub fn api_versions(&self) -> impl Iterator<Item = semver::Version> + '_ {
@@ -797,6 +899,7 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             graft,
             templates,
             chain,
+            indexer_hints,
         } = self;
 
         if !(MIN_SPEC_VERSION..=max_spec_version.clone()).contains(&spec_version) {
@@ -816,7 +919,9 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             );
         }
 
-        let schema = schema.resolve(id.clone(), resolver, logger).await?;
+        let schema = schema
+            .resolve(&spec_version, id.clone(), resolver, logger)
+            .await?;
 
         let (data_sources, templates) = try_join(
             data_sources
@@ -858,6 +963,22 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             );
         }
 
+        if spec_version < SPEC_VERSION_0_0_9
+            && data_sources.iter().any(|ds| ds.end_block().is_some())
+        {
+            bail!(
+                "Defining `endBlock` in the manifest is not supported prior to {}",
+                SPEC_VERSION_0_0_9
+            );
+        }
+
+        if spec_version < SPEC_VERSION_1_0_0 && indexer_hints.is_some() {
+            bail!(
+                "`indexerHints` are not supported prior to {}",
+                SPEC_VERSION_1_0_0
+            );
+        }
+
         // Check the min_spec_version of each data source against the spec version of the subgraph
         let min_spec_version_mismatch = data_sources
             .iter()
@@ -884,6 +1005,7 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             graft,
             templates,
             chain,
+            indexer_hints,
         })
     }
 }
@@ -908,6 +1030,8 @@ pub struct DeploymentState {
     pub latest_block: BlockPtr,
     /// The earliest block that the subgraph has processed
     pub earliest_block_number: BlockNumber,
+    /// The first block at which the subgraph has a deterministic error
+    pub first_error_block: Option<BlockNumber>,
 }
 
 impl DeploymentState {
@@ -932,6 +1056,13 @@ impl DeploymentState {
             ));
         }
         Ok(())
+    }
+
+    /// Return `true` if the subgraph has a deterministic error visible at
+    /// `block`
+    pub fn has_deterministic_errors(&self, block: &BlockPtr) -> bool {
+        self.first_error_block
+            .map_or(false, |first_error_block| first_error_block <= block.number)
     }
 }
 

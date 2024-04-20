@@ -15,6 +15,10 @@ pub struct EnvVarsStore {
     /// Set by the environment variable `GRAPH_QUERY_STATS_REFRESH_INTERVAL`
     /// (expressed in seconds). The default value is 300 seconds.
     pub query_stats_refresh_interval: Duration,
+    /// How long entries in the schema cache are kept before they are
+    /// evicted in seconds. Defaults to
+    /// `2*GRAPH_QUERY_STATS_REFRESH_INTERVAL`
+    pub schema_cache_ttl: Duration,
     /// This can be used to effectively disable the query semaphore by setting
     /// it to a high number, but there's typically no need to configure this.
     ///
@@ -109,6 +113,13 @@ pub struct EnvVarsStore {
     /// is 10_000 which corresponds to 10MB. Setting this to 0 disables
     /// write batching.
     pub write_batch_size: usize,
+    /// Whether to create GIN indexes for array attributes. Set by
+    /// `GRAPH_STORE_CREATE_GIN_INDEXES`. The default is `false`
+    pub create_gin_indexes: bool,
+    /// Temporary env var in case we need to quickly rollback PR #5010
+    pub use_brin_for_all_query_types: bool,
+    /// Temporary env var to disable certain lookups in the chain store
+    pub disable_block_cache_for_lookup: bool,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -125,6 +136,10 @@ impl From<InnerStore> for EnvVarsStore {
             query_stats_refresh_interval: Duration::from_secs(
                 x.query_stats_refresh_interval_in_secs,
             ),
+            schema_cache_ttl: x
+                .schema_cache_ttl
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| Duration::from_secs(2 * x.query_stats_refresh_interval_in_secs)),
             extra_query_permits: x.extra_query_permits,
             large_notification_cleanup_interval: Duration::from_secs(
                 x.large_notification_cleanup_interval_in_secs,
@@ -150,6 +165,9 @@ impl From<InnerStore> for EnvVarsStore {
             history_slack_factor: x.history_slack_factor.0,
             write_batch_duration: Duration::from_secs(x.write_batch_duration_in_secs),
             write_batch_size: x.write_batch_size * 1_000,
+            create_gin_indexes: x.create_gin_indexes,
+            use_brin_for_all_query_types: x.use_brin_for_all_query_types,
+            disable_block_cache_for_lookup: x.disable_block_cache_for_lookup,
         }
     }
 }
@@ -160,6 +178,8 @@ pub struct InnerStore {
     chain_head_watcher_timeout_in_secs: u64,
     #[envconfig(from = "GRAPH_QUERY_STATS_REFRESH_INTERVAL", default = "300")]
     query_stats_refresh_interval_in_secs: u64,
+    #[envconfig(from = "GRAPH_SCHEMA_CACHE_TTL")]
+    schema_cache_ttl: Option<u64>,
     #[envconfig(from = "GRAPH_EXTRA_QUERY_PERMITS", default = "0")]
     extra_query_permits: usize,
     #[envconfig(from = "LARGE_NOTIFICATION_CLEANUP_INTERVAL", default = "300")]
@@ -203,6 +223,12 @@ pub struct InnerStore {
     write_batch_duration_in_secs: u64,
     #[envconfig(from = "GRAPH_STORE_WRITE_BATCH_SIZE", default = "10000")]
     write_batch_size: usize,
+    #[envconfig(from = "GRAPH_STORE_CREATE_GIN_INDEXES", default = "false")]
+    create_gin_indexes: bool,
+    #[envconfig(from = "GRAPH_STORE_USE_BRIN_FOR_ALL_QUERY_TYPES", default = "false")]
+    use_brin_for_all_query_types: bool,
+    #[envconfig(from = "GRAPH_STORE_DISABLE_BLOCK_CACHE_FOR_LOOKUP", default = "false")]
+    disable_block_cache_for_lookup: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

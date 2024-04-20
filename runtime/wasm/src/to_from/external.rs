@@ -1,5 +1,6 @@
 use ethabi;
 
+use graph::data::store::scalar::Timestamp;
 use graph::data::value::Word;
 use graph::prelude::{BigDecimal, BigInt};
 use graph::runtime::gas::GasCounter;
@@ -13,6 +14,16 @@ use graph::{prelude::web3::types as web3, runtime::AscHeap};
 use crate::asc_abi::class::*;
 
 impl ToAscObj<Uint8Array> for web3::H160 {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<Uint8Array, HostExportError> {
+        self.0.to_asc_obj(heap, gas)
+    }
+}
+
+impl ToAscObj<Uint8Array> for web3::Bytes {
     fn to_asc_obj<H: AscHeap + ?Sized>(
         &self,
         heap: &mut H,
@@ -258,6 +269,12 @@ impl FromAscObj<AscEnum<StoreValueKind>> for store::Value {
             }
             StoreValueKind::Int => Value::Int(i32::from(payload)),
             StoreValueKind::Int8 => Value::Int8(i64::from(payload)),
+            StoreValueKind::Timestamp => {
+                let ts = Timestamp::from_microseconds_since_epoch(i64::from(payload))
+                    .map_err(|e| DeterministicHostError::Other(e.into()))?;
+
+                Value::Timestamp(ts)
+            }
             StoreValueKind::BigDecimal => {
                 let ptr: AscPtr<AscBigDecimal> = AscPtr::from(payload);
                 Value::BigDecimal(asc_get(heap, ptr, gas, depth)?)
@@ -294,6 +311,7 @@ impl ToAscObj<AscEnum<StoreValueKind>> for store::Value {
             Value::String(string) => asc_new(heap, string.as_str(), gas)?.into(),
             Value::Int(n) => EnumPayload::from(*n),
             Value::Int8(n) => EnumPayload::from(*n),
+            Value::Timestamp(n) => EnumPayload::from(n),
             Value::BigDecimal(n) => asc_new(heap, n, gas)?.into(),
             Value::Bool(b) => EnumPayload::from(*b),
             Value::List(array) => asc_new(heap, array.as_slice(), gas)?.into(),
@@ -407,6 +425,7 @@ impl From<u32> for LogLevel {
 impl<T: AscValue> ToAscObj<AscWrapped<T>> for AscWrapped<T> {
     fn to_asc_obj<H: AscHeap + ?Sized>(
         &self,
+
         _heap: &mut H,
         _gas: &GasCounter,
     ) -> Result<AscWrapped<T>, HostExportError> {
